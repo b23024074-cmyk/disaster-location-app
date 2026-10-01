@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "537300321237",
+    "project_id": "disaster-location-app",
+    "storage_bucket": "disaster-location-app.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:537300321237:android:4066cdfa640b6172fe735c",
+        "android_client_info": {
+          "package_name": "com.example.my_app"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyAQR5nnlnwZ-cv6_m-joIeudkyZCGpOiEU"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
