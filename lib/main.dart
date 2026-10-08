@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'package:connectivity_plus/connectivity_plus.dart';
 import 'dart:convert';
 
 import 'package:flutter/material.dart';
@@ -62,6 +63,9 @@ class _MyHomePageState extends State<MyHomePage> {
   bool rescueRequest = false;
 
   Timer? locationTimer;
+  StreamSubscription<List<ConnectivityResult>>? connectivitySubscription;
+  bool isNetworkConnected = false;
+  bool isUploadingLocation = false;
 
   List<Map<String, dynamic>> relayedPeople = [];
 
@@ -69,6 +73,7 @@ class _MyHomePageState extends State<MyHomePage> {
   void initState() {
     super.initState();
     initUser();
+    startConnectivityMonitoring();
 
     locationTimer = Timer.periodic(
       const Duration(seconds: 10),
@@ -79,9 +84,85 @@ class _MyHomePageState extends State<MyHomePage> {
   @override
   void dispose() {
     locationTimer?.cancel();
+    connectivitySubscription?.cancel();
     displayNameController.dispose();
     friendIdController.dispose();
     super.dispose();
+  }
+
+
+  Future<void> startConnectivityMonitoring() async {
+    final initialResults = await Connectivity().checkConnectivity();
+    await handleConnectivityChanged(initialResults);
+    connectivitySubscription =
+        Connectivity().onConnectivityChanged.listen(handleConnectivityChanged);
+  }
+
+  Future<void> handleConnectivityChanged(
+    List<ConnectivityResult> results,
+  ) async {
+    final connected =
+        results.any((result) => result != ConnectivityResult.none);
+    final wasConnected = isNetworkConnected;
+    isNetworkConnected = connected;
+    if (mounted) setState(() {});
+    if (connected && !wasConnected) {
+      if (latitude != null && longitude != null) {
+        await saveDataToFirebase();
+      } else {
+        await uploadPendingLocation();
+      }
+    }
+  }
+
+  Future<void> savePendingLocationLocally() async {
+    if (latitude == null || longitude == null) return;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setDouble('pending_latitude', latitude!);
+    await prefs.setDouble('pending_longitude', longitude!);
+    await prefs.setDouble('pending_accuracy', accuracy ?? 0);
+    await prefs.setInt('pending_battery', batteryLevel ?? -1);
+    await prefs.setBool('pending_location_upload', true);
+  }
+
+  Future<void> uploadPendingLocation() async {
+    if (!isNetworkConnected || myUserId.isEmpty || isUploadingLocation) {
+      return;
+    }
+    final prefs = await SharedPreferences.getInstance();
+    if (!(prefs.getBool('pending_location_upload') ?? false)) return;
+
+    try {
+      isUploadingLocation = true;
+      final lat = prefs.getDouble('pending_latitude');
+      final lng = prefs.getDouble('pending_longitude');
+      final acc = prefs.getDouble('pending_accuracy');
+      final bat = prefs.getInt('pending_battery');
+      if (lat == null || lng == null) return;
+
+      await FirebaseFirestore.instance.collection('users').doc(myUserId).set({
+        'userId': myUserId,
+        'displayName': displayName,
+        'friendIds': friendIds,
+        'latitude': lat,
+        'longitude': lng,
+        'accuracy': acc,
+        'batteryLevel': bat != null && bat >= 0 ? bat : null,
+        'safetyStatus': safetyStatus,
+        'rescueRequest': rescueRequest,
+        'updatedAt': FieldValue.serverTimestamp(),
+      }, SetOptions(merge: true));
+
+      await prefs.remove('pending_latitude');
+      await prefs.remove('pending_longitude');
+      await prefs.remove('pending_accuracy');
+      await prefs.remove('pending_battery');
+      await prefs.remove('pending_location_upload');
+    } catch (_) {
+      // 次回の再接続時に再試行
+    } finally {
+      isUploadingLocation = false;
+    }
   }
 
   Future<void> initUser() async {
@@ -166,25 +247,31 @@ class _MyHomePageState extends State<MyHomePage> {
     if (myUserId.isEmpty) return;
 
     final currentBatteryLevel = await getBatteryLevelSafely();
-
     if (mounted) {
-      setState(() {
-        batteryLevel = currentBatteryLevel;
-      });
+      setState(() => batteryLevel = currentBatteryLevel);
     }
 
-    await FirebaseFirestore.instance.collection('users').doc(myUserId).set({
-      'userId': myUserId,
-      'displayName': displayName,
-      'friendIds': friendIds,
-      'latitude': latitude,
-      'longitude': longitude,
-      'accuracy': accuracy,
-      'batteryLevel': currentBatteryLevel,
-      'safetyStatus': safetyStatus,
-      'rescueRequest': rescueRequest,
-      'updatedAt': FieldValue.serverTimestamp(),
-    }, SetOptions(merge: true));
+    if (!isNetworkConnected) {
+      await savePendingLocationLocally();
+      return;
+    }
+
+    try {
+      await FirebaseFirestore.instance.collection('users').doc(myUserId).set({
+        'userId': myUserId,
+        'displayName': displayName,
+        'friendIds': friendIds,
+        'latitude': latitude,
+        'longitude': longitude,
+        'accuracy': accuracy,
+        'batteryLevel': currentBatteryLevel,
+        'safetyStatus': safetyStatus,
+        'rescueRequest': rescueRequest,
+        'updatedAt': FieldValue.serverTimestamp(),
+      }, SetOptions(merge: true));
+    } catch (_) {
+      await savePendingLocationLocally();
+    }
   }
 
   Future<void> addFriend() async {
@@ -846,7 +933,7 @@ class _MyHomePageState extends State<MyHomePage> {
       context,
       MaterialPageRoute(
         builder: (_) =>
-            AllUsersMapPage(myUserId: myUserId, friendIds: friendIds),
+            const AllUsersMapPage(),
       ),
     );
   }
@@ -1357,13 +1444,8 @@ class _QrScannerPageState extends State<QrScannerPage> {
 }
 
 class AllUsersMapPage extends StatelessWidget {
-  final String myUserId;
-  final List<String> friendIds;
-
   const AllUsersMapPage({
     super.key,
-    required this.myUserId,
-    required this.friendIds,
   });
 
   String connectionStatus(dynamic updatedAt) {
@@ -1628,8 +1710,6 @@ class AllUsersMapPage extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final targetIds = {myUserId, ...friendIds};
-
     return Scaffold(
       appBar: AppBar(title: const Text('全員の位置')),
       body: Column(
@@ -1661,7 +1741,6 @@ class AllUsersMapPage extends StatelessWidget {
                 LatLng center = const LatLng(26.6232, 127.9747);
 
                 for (final doc in snapshot.data!.docs) {
-                  if (!targetIds.contains(doc.id)) continue;
 
                   final data = doc.data() as Map<String, dynamic>;
 
