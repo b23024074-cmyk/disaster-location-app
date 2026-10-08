@@ -933,7 +933,7 @@ class _MyHomePageState extends State<MyHomePage> {
       context,
       MaterialPageRoute(
         builder: (_) =>
-            const AllUsersMapPage(),
+            AllUsersMapPage(myUserId: myUserId, friendIds: friendIds),
       ),
     );
   }
@@ -1444,8 +1444,13 @@ class _QrScannerPageState extends State<QrScannerPage> {
 }
 
 class AllUsersMapPage extends StatelessWidget {
+  final String myUserId;
+  final List<String> friendIds;
+
   const AllUsersMapPage({
     super.key,
+    required this.myUserId,
+    required this.friendIds,
   });
 
   String connectionStatus(dynamic updatedAt) {
@@ -1740,7 +1745,10 @@ class AllUsersMapPage extends StatelessWidget {
 
                 LatLng center = const LatLng(26.6232, 127.9747);
 
+                final allowedIds = <String>{myUserId, ...friendIds};
+
                 for (final doc in snapshot.data!.docs) {
+                  if (!allowedIds.contains(doc.id)) continue;
 
                   final data = doc.data() as Map<String, dynamic>;
 
