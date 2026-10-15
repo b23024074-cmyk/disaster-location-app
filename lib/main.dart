@@ -2156,7 +2156,7 @@ class _LoginPageState extends State<LoginPage> {
   }
 }
 
-// ホスト専用画面（フィルタリング機能付き管理画面）
+// ホスト専用画面（アプリ内マップ表示機能付き）
 class HostPage extends StatefulWidget {
   const HostPage({super.key});
 
@@ -2165,9 +2165,126 @@ class HostPage extends StatefulWidget {
 }
 
 class _HostPageState extends State<HostPage> {
-  // フィルター設定の初期値
-  String _statusFilter = 'ALL'; // 'ALL', 'RESCUE' (要救助/重症), 'SAFE' (無事)
+  String _statusFilter = 'ALL'; // 'ALL', 'RESCUE', 'SAFE'
   bool _lowBatteryOnly = false; // 充電20%以下フィルター
+
+  // ユーザー詳細 & アプリ内マップダイアログの表示
+  void _showUserDetailDialog(
+    BuildContext context,
+    String name,
+    String email,
+    String userId,
+    String safetyStatus,
+    int battery,
+    dynamic lat,
+    dynamic lng,
+  ) {
+    // 座標値の数値変換
+    final double? latitude = lat is num ? lat.toDouble() : double.tryParse(lat?.toString() ?? '');
+    final double? longitude = lng is num ? lng.toDouble() : double.tryParse(lng?.toString() ?? '');
+    final bool hasLocation = latitude != null && longitude != null;
+
+    showDialog(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+          title: Row(
+            children: [
+              const Icon(Icons.person_pin_circle, color: Colors.indigo, size: 28),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  '$name さんの詳細情報',
+                  style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                ),
+              ),
+            ],
+          ),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+             crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text('メールアドレス: $email'),
+                Text('ユーザーID: $userId'),
+                const Divider(height: 20),
+                Text('安否状況: $safetyStatus', style: const TextStyle(fontWeight: FontWeight.bold)),
+                Text('バッテリー残量: $battery%'),
+                const SizedBox(height: 12),
+                
+                // 位置情報がある場合：アプリ内で地図を表示
+                if (hasLocation) ...[
+                  const Text('📍 位置情報マップ:', style: TextStyle(fontWeight: FontWeight.bold)),
+                  const SizedBox(height: 8),
+                  ClipRRect(
+                    borderRadius: BorderRadius.circular(12),
+                    child: SizedBox(
+                      height: 220,
+                      width: double.maxFinite,
+                      child: FlutterMap(
+                        options: MapOptions(
+                          initialCenter: LatLng(latitude, longitude),
+                          initialZoom: 15.0,
+                        ),
+                        children: [
+                          TileLayer(
+                            urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+                            userAgentPackageName: 'com.example.disaster_location_app',
+                          ),
+                          MarkerLayer(
+                            markers: [
+                              Marker(
+                                point: LatLng(latitude, longitude),
+                                width: 40,
+                                height: 40,
+                                child: const Icon(
+                                  Icons.location_on,
+                                  color: Colors.red,
+                                  size: 40,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 6),
+                  Text(
+                    '緯度: $latitude, 経度: $longitude',
+                    style: const TextStyle(fontSize: 11, color: Colors.grey),
+                  ),
+                ] else ...[
+                  Container(
+                    width: double.infinity,
+                    padding: const EdgeInsets.all(12),
+                    decoration: BoxDecoration(
+                      color: Colors.grey.shade200,
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    child: const Row(
+                      children: [
+                        Icon(Icons.location_off, color: Colors.grey),
+                        SizedBox(width: 8),
+                        Text('位置情報が登録されていません', style: TextStyle(color: Colors.black54)),
+                      ],
+                    ),
+                  ),
+                ],
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('閉じる'),
+            ),
+          ],
+        );
+      },
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -2201,16 +2318,12 @@ class _HostPageState extends State<HostPage> {
                 children: [
                   const Text('表示切替: ', style: TextStyle(fontWeight: FontWeight.bold)),
                   const SizedBox(width: 8),
-                  
-                  // ALL ボタン
                   FilterChip(
                     label: const Text('ALL'),
                     selected: _statusFilter == 'ALL',
                     onSelected: (selected) => setState(() => _statusFilter = 'ALL'),
                   ),
                   const SizedBox(width: 8),
-
-                  // 救助要請・重症 ボタン
                   FilterChip(
                     avatar: const Icon(Icons.warning, color: Colors.red, size: 18),
                     label: const Text('要救助 / 重症'),
@@ -2219,8 +2332,6 @@ class _HostPageState extends State<HostPage> {
                     onSelected: (selected) => setState(() => _statusFilter = 'RESCUE'),
                   ),
                   const SizedBox(width: 8),
-
-                  // 無事 ボタン
                   FilterChip(
                     avatar: const Icon(Icons.check_circle, color: Colors.green, size: 18),
                     label: const Text('無事'),
@@ -2229,8 +2340,6 @@ class _HostPageState extends State<HostPage> {
                     onSelected: (selected) => setState(() => _statusFilter = 'SAFE'),
                   ),
                   const SizedBox(width: 16),
-
-                  // 充電低残量 フィルター
                   FilterChip(
                     avatar: const Icon(Icons.battery_alert, color: Colors.orange, size: 18),
                     label: const Text('充電20%以下'),
@@ -2243,7 +2352,7 @@ class _HostPageState extends State<HostPage> {
             ),
           ),
 
-          // ② Firestoreからのリアルタイムユーザーリスト取得＆フィルタリング
+          // ② ユーザーリスト
           Expanded(
             child: StreamBuilder<QuerySnapshot>(
               stream: FirebaseFirestore.instance.collection('users').snapshots(),
@@ -2257,7 +2366,6 @@ class _HostPageState extends State<HostPage> {
 
                 final docs = snapshot.data?.docs ?? [];
 
-                // 条件による絞り込み処理
                 final filteredUsers = docs.where((doc) {
                   final data = doc.data() as Map<String, dynamic>;
 
@@ -2267,11 +2375,8 @@ class _HostPageState extends State<HostPage> {
                   final isSafe = data['safetyStatus'] == '無事';
                   final battery = (data['batteryLevel'] as num?)?.toInt() ?? 100;
 
-                  // ステータス絞り込み
                   if (_statusFilter == 'RESCUE' && !isRescue) return false;
                   if (_statusFilter == 'SAFE' && !isSafe) return false;
-
-                  // バッテリー絞り込み
                   if (_lowBatteryOnly && battery > 20) return false;
 
                   return true;
@@ -2305,6 +2410,18 @@ class _HostPageState extends State<HostPage> {
                       elevation: 3,
                       margin: const EdgeInsets.symmetric(vertical: 6),
                       child: ListTile(
+                        onTap: () {
+                          _showUserDetailDialog(
+                            context,
+                            name,
+                            email,
+                            userId,
+                            safetyStatus,
+                            battery,
+                            lat,
+                            lng,
+                          );
+                        },
                         leading: CircleAvatar(
                           backgroundColor: isRescue ? Colors.red : Colors.green,
                           child: Icon(
