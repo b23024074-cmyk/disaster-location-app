@@ -24,7 +24,7 @@ void main() async {
 class MyApp extends StatelessWidget {
   const MyApp({super.key});
 
-  @override
+@override
   Widget build(BuildContext context) {
     return MaterialApp(
       debugShowCheckedModeBanner: false,
@@ -32,7 +32,7 @@ class MyApp extends StatelessWidget {
       theme: ThemeData(
         colorScheme: ColorScheme.fromSeed(seedColor: Colors.deepPurple),
       ),
-      home: const MyHomePage(),
+      home: const LoginPage(),
     );
   }
 }
@@ -178,6 +178,11 @@ class _MyHomePageState extends State<MyHomePage> {
     final savedFriendIds = prefs.getStringList('friend_ids') ?? [];
     final currentBatteryLevel = await getBatteryLevelSafely();
     final savedRelayedPeople = loadRelayedPeopleFromPrefs(prefs);
+    // Firestore上にusersドキュメントを初期作成・更新する
+    await FirebaseFirestore.instance.collection('users').doc(savedUserId).set({
+      'role': 'user',
+      'shared_with': savedFriendIds,
+    }, SetOptions(merge: true));
 
     setState(() {
       myUserId = savedUserId!;
@@ -1912,6 +1917,432 @@ class AllUsersMapPage extends StatelessWidget {
                     CircleLayer(circles: accuracyCircles),
                     MarkerLayer(markers: markers),
                   ],
+                );
+              },
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+// ログイン・新規登録画面
+class LoginPage extends StatefulWidget {
+  const LoginPage({super.key});
+
+  @override
+  State<LoginPage> createState() => _LoginPageState();
+}
+
+class _LoginPageState extends State<LoginPage> {
+  bool _isSignUp = false; // false: ログインモード, true: 新規登録モード
+  final TextEditingController _inputController = TextEditingController();
+  bool _isLoading = false;
+
+  // ログイン処理（IDまたはメールアドレス）
+  Future<void> _login() async {
+    final input = _inputController.text.trim();
+    if (input.isEmpty) {
+      _showSnackBar('IDまたはメールアドレスを入力してください');
+      return;
+    }
+
+    setState(() => _isLoading = true);
+
+    try {
+      String? targetUserId;
+      Map<String, dynamic>? userData;
+
+      if (input.contains('@')) {
+        // ① メールアドレスでの検索
+        final query = await FirebaseFirestore.instance
+            .collection('users')
+            .where('email', isEqualTo: input)
+            .limit(1)
+            .get();
+
+        if (query.docs.isNotEmpty) {
+          targetUserId = query.docs.first.id;
+          userData = query.docs.first.data();
+        }
+      } else {
+        // ② ユーザーIDでの検索
+        final doc = await FirebaseFirestore.instance.collection('users').doc(input).get();
+        if (doc.exists) {
+          targetUserId = doc.id;
+          userData = doc.data();
+        }
+      }
+
+      if (!mounted) return;
+
+      if (userData == null || targetUserId == null) {
+        _showSnackBar('該当するアカウントが見つかりませんでした');
+        return;
+      }
+
+      // IDのローカル保存
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString('user_id', targetUserId);
+
+      if (!mounted) return;
+
+      // ロールに応じた画面遷移
+      if (userData['role'] == 'host') {
+        Navigator.pushReplacement(
+          context,
+          MaterialPageRoute(builder: (context) => const HostPage()),
+        );
+      } else {
+        Navigator.pushReplacement(
+          context,
+          MaterialPageRoute(builder: (context) => const MyHomePage()),
+        );
+      }
+    } catch (e) {
+      if (!mounted) return;
+      _showSnackBar('エラーが発生しました: $e');
+    } finally {
+      if (mounted) setState(() => _isLoading = false);
+    }
+  }
+
+  // 新規アカウント作成処理
+  Future<void> _signUp() async {
+    final email = _inputController.text.trim();
+    if (email.isEmpty || !email.contains('@')) {
+      _showSnackBar('有効なメールアドレスを入力してください');
+      return;
+    }
+
+    setState(() => _isLoading = true);
+
+    try {
+      // 既存のメールアドレスチェック
+      final existing = await FirebaseFirestore.instance
+          .collection('users')
+          .where('email', isEqualTo: email)
+          .limit(1)
+          .get();
+
+      if (existing.docs.isNotEmpty) {
+        if (!mounted) return;
+        _showSnackBar('このメールアドレスは既に登録されています。ログインしてください。');
+        return;
+      }
+
+      // 新しいIDを自動割り振る (例: user_タイムスタンプ)
+      final generatedId = 'user_${DateTime.now().millisecondsSinceEpoch}';
+
+      // Firestoreに登録
+      await FirebaseFirestore.instance.collection('users').doc(generatedId).set({
+        'userId': generatedId,
+        'email': email,
+        'role': 'general',
+        'createdAt': FieldValue.serverTimestamp(),
+      }, SetOptions(merge: true));
+
+      // IDをローカル保存
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString('user_id', generatedId);
+
+      if (!mounted) return;
+
+      // 割り振られたIDをユーザーにお知らせして画面遷移
+      await showDialog(
+        context: context,
+        barrierDismissible: false,
+        builder: (context) => AlertDialog(
+          title: const Text('アカウント作成完了'),
+          content: Text('あなた専用のユーザーIDが発行されました:\n\n$generatedId\n\n次回からはこのIDまたはメールアドレスでログインできます。'),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('OK'),
+            ),
+          ],
+        ),
+      );
+
+      if (!mounted) return;
+
+      // 一般向け画面へ遷移
+      Navigator.pushReplacement(
+        context,
+        MaterialPageRoute(builder: (context) => const MyHomePage()),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      _showSnackBar('登録エラーが発生しました: $e');
+    } finally {
+      if (mounted) setState(() => _isLoading = false);
+    }
+  }
+
+  void _showSnackBar(String text) {
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(text)));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: Text(_isSignUp ? '新規アカウント作成' : 'ログイン'),
+      ),
+      body: Padding(
+        padding: const EdgeInsets.all(24.0),
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Icon(
+              _isSignUp ? Icons.person_add : Icons.security,
+              size: 80,
+              color: Colors.indigo,
+            ),
+            const SizedBox(height: 24),
+
+            // モード切り替え（ログイン / 新規作成）
+            Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                ChoiceChip(
+                  label: const Text('ログイン'),
+                  selected: !_isSignUp,
+                  onSelected: (selected) {
+                    if (selected) setState(() => _isSignUp = false);
+                  },
+                ),
+                const SizedBox(width: 12),
+                ChoiceChip(
+                  label: const Text('新規作成'),
+                  selected: _isSignUp,
+                  onSelected: (selected) {
+                    if (selected) setState(() => _isSignUp = true);
+                  },
+                ),
+              ],
+            ),
+            const SizedBox(height: 24),
+
+            // 入力フィールド
+            TextField(
+              controller: _inputController,
+              decoration: InputDecoration(
+                labelText: _isSignUp ? 'メールアドレスを入力' : 'ID または メールアドレスを入力',
+                border: const OutlineInputBorder(),
+                prefixIcon: Icon(_isSignUp ? Icons.email : Icons.person),
+              ),
+            ),
+            const SizedBox(height: 20),
+
+            // 実行ボタン
+            _isLoading
+                ? const CircularProgressIndicator()
+                : SizedBox(
+                    width: double.infinity,
+                    height: 50,
+                    child: ElevatedButton(
+                      onPressed: _isSignUp ? _signUp : _login,
+                      child: Text(
+                        _isSignUp ? 'アカウントを作成してスタート' : 'ログイン',
+                        style: const TextStyle(fontSize: 18),
+                      ),
+                    ),
+                  ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// ホスト専用画面（フィルタリング機能付き管理画面）
+class HostPage extends StatefulWidget {
+  const HostPage({super.key});
+
+  @override
+  State<HostPage> createState() => _HostPageState();
+}
+
+class _HostPageState extends State<HostPage> {
+  // フィルター設定の初期値
+  String _statusFilter = 'ALL'; // 'ALL', 'RESCUE' (要救助/重症), 'SAFE' (無事)
+  bool _lowBatteryOnly = false; // 充電20%以下フィルター
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('ホスト管理者画面'),
+        backgroundColor: Colors.indigo,
+        foregroundColor: Colors.white,
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.logout),
+            tooltip: 'ログアウト',
+            onPressed: () {
+              Navigator.pushReplacement(
+                context,
+                MaterialPageRoute(builder: (context) => const LoginPage()),
+              );
+            },
+          ),
+        ],
+      ),
+      body: Column(
+        children: [
+          // ① 絞り込みフィルター（操作バー）
+          Container(
+            padding: const EdgeInsets.all(12),
+            color: Colors.indigo.shade50,
+            child: SingleChildScrollView(
+              scrollDirection: Axis.horizontal,
+              child: Row(
+                children: [
+                  const Text('表示切替: ', style: TextStyle(fontWeight: FontWeight.bold)),
+                  const SizedBox(width: 8),
+                  
+                  // ALL ボタン
+                  FilterChip(
+                    label: const Text('ALL'),
+                    selected: _statusFilter == 'ALL',
+                    onSelected: (selected) => setState(() => _statusFilter = 'ALL'),
+                  ),
+                  const SizedBox(width: 8),
+
+                  // 救助要請・重症 ボタン
+                  FilterChip(
+                    avatar: const Icon(Icons.warning, color: Colors.red, size: 18),
+                    label: const Text('要救助 / 重症'),
+                    selected: _statusFilter == 'RESCUE',
+                    selectedColor: Colors.red.shade100,
+                    onSelected: (selected) => setState(() => _statusFilter = 'RESCUE'),
+                  ),
+                  const SizedBox(width: 8),
+
+                  // 無事 ボタン
+                  FilterChip(
+                    avatar: const Icon(Icons.check_circle, color: Colors.green, size: 18),
+                    label: const Text('無事'),
+                    selected: _statusFilter == 'SAFE',
+                    selectedColor: Colors.green.shade100,
+                    onSelected: (selected) => setState(() => _statusFilter = 'SAFE'),
+                  ),
+                  const SizedBox(width: 16),
+
+                  // 充電低残量 フィルター
+                  FilterChip(
+                    avatar: const Icon(Icons.battery_alert, color: Colors.orange, size: 18),
+                    label: const Text('充電20%以下'),
+                    selected: _lowBatteryOnly,
+                    selectedColor: Colors.orange.shade100,
+                    onSelected: (selected) => setState(() => _lowBatteryOnly = selected),
+                  ),
+                ],
+              ),
+            ),
+          ),
+
+          // ② Firestoreからのリアルタイムユーザーリスト取得＆フィルタリング
+          Expanded(
+            child: StreamBuilder<QuerySnapshot>(
+              stream: FirebaseFirestore.instance.collection('users').snapshots(),
+              builder: (context, snapshot) {
+                if (snapshot.hasError) {
+                  return Center(child: Text('エラーが発生しました: ${snapshot.error}'));
+                }
+                if (snapshot.connectionState == ConnectionState.waiting) {
+                  return const Center(child: CircularProgressIndicator());
+                }
+
+                final docs = snapshot.data?.docs ?? [];
+
+                // 条件による絞り込み処理
+                final filteredUsers = docs.where((doc) {
+                  final data = doc.data() as Map<String, dynamic>;
+
+                  final isRescue = data['rescueRequest'] == true ||
+                      data['safetyStatus'] == '重症' ||
+                      data['safetyStatus'] == '要救助';
+                  final isSafe = data['safetyStatus'] == '無事';
+                  final battery = (data['batteryLevel'] as num?)?.toInt() ?? 100;
+
+                  // ステータス絞り込み
+                  if (_statusFilter == 'RESCUE' && !isRescue) return false;
+                  if (_statusFilter == 'SAFE' && !isSafe) return false;
+
+                  // バッテリー絞り込み
+                  if (_lowBatteryOnly && battery > 20) return false;
+
+                  return true;
+                }).toList();
+
+                if (filteredUsers.isEmpty) {
+                  return const Center(
+                    child: Text(
+                      '指定した条件に該当するユーザーはいません',
+                      style: TextStyle(fontSize: 16, color: Colors.grey),
+                    ),
+                  );
+                }
+
+                return ListView.builder(
+                  padding: const EdgeInsets.all(12),
+                  itemCount: filteredUsers.length,
+                  itemBuilder: (context, index) {
+                    final data = filteredUsers[index].data() as Map<String, dynamic>;
+
+                    final name = data['displayName'] ?? '名前なし';
+                    final email = data['email'] ?? 'メールなし';
+                    final userId = data['userId'] ?? filteredUsers[index].id;
+                    final safetyStatus = data['safetyStatus'] ?? '未登録';
+                    final isRescue = data['rescueRequest'] == true || safetyStatus == '重症';
+                    final battery = (data['batteryLevel'] as num?)?.toInt() ?? 0;
+                    final lat = data['latitude'];
+                    final lng = data['longitude'];
+
+                    return Card(
+                      elevation: 3,
+                      margin: const EdgeInsets.symmetric(vertical: 6),
+                      child: ListTile(
+                        leading: CircleAvatar(
+                          backgroundColor: isRescue ? Colors.red : Colors.green,
+                          child: Icon(
+                            isRescue ? Icons.warning_amber_rounded : Icons.person,
+                            color: Colors.white,
+                          ),
+                        ),
+                        title: Row(
+                          children: [
+                            Text(name, style: const TextStyle(fontWeight: FontWeight.bold)),
+                            const SizedBox(width: 8),
+                            Text('($email)', style: const TextStyle(fontSize: 12, color: Colors.grey)),
+                          ],
+                        ),
+                        subtitle: Padding(
+                          padding: const EdgeInsets.only(top: 4),
+                          child: Column(
+                           crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text('ID: $userId'),
+                              Text('安否状況: $safetyStatus'),
+                              Text('位置情報: ${lat != null && lng != null ? "$lat, $lng" : "未取得"}'),
+                            ],
+                          ),
+                        ),
+                        trailing: Column(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            Icon(
+                              battery <= 20 ? Icons.battery_alert : Icons.battery_std,
+                              color: battery <= 20 ? Colors.red : Colors.grey,
+                            ),
+                            Text('$battery%', style: const TextStyle(fontSize: 12)),
+                          ],
+                        ),
+                      ),
+                    );
+                  },
                 );
               },
             ),
