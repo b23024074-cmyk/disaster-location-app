@@ -14,6 +14,9 @@ import 'package:mobile_scanner/mobile_scanner.dart';
 import 'package:battery_plus/battery_plus.dart';
 
 import 'firebase_options.dart';
+import 'package:flutter_compass/flutter_compass.dart';
+import 'dart:math' as math;
+
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -1369,39 +1372,96 @@ class _MyHomePageState extends State<MyHomePage> {
     );
   }
 
-  @override
+@override
   Widget build(BuildContext context) {
     return Scaffold(
+      // 背景色を清潔感のある明るいグレーに設定
+      backgroundColor: const Color(0xFFF8F9FA),
       appBar: AppBar(
-        title: const Text('災害位置共有アプリ'),
-        backgroundColor: Theme.of(context).colorScheme.inversePrimary,
+        title: const Text(
+          '災害位置共有アプリ',
+          style: TextStyle(fontWeight: FontWeight.bold, fontSize: 18),
+        ),
+        elevation: 0,
+        backgroundColor: const Color(0xFF1A365D), // 信頼感のあるネイビー
+        foregroundColor: Colors.white,
+        centerTitle: false,
         actions: [
-          IconButton(icon: const Icon(Icons.qr_code), onPressed: showMyQrCode),
           IconButton(
-            icon: const Icon(Icons.groups),
+            icon: const Icon(Icons.map_outlined),
+            tooltip: '全員の位置を地図で見る',
             onPressed: openAllUsersMap,
           ),
         ],
       ),
-      body: SingleChildScrollView(
-        padding: const EdgeInsets.all(12),
-        child: Column(
-          children: [
-            myProfileCard(),
-            const SizedBox(height: 12),
-            myLocationCard(),
-            const SizedBox(height: 12),
-            myStatusCard(),
-            const SizedBox(height: 12),
-            offlineRelayQrCard(),
-            const SizedBox(height: 12),
-            relayedPeopleCard(),
-            const SizedBox(height: 12),
-            friendRegisterCard(),
-            const SizedBox(height: 12),
-            friendListCard(),
-            const SizedBox(height: 40),
-          ],
+      body: SafeArea(
+        child: Center(
+          // PC画面での横伸びを防ぐレスポンシブ制約（最大幅600px）
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 600),
+            child: SingleChildScrollView(
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 16),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  // 1. 【最優先】自分の安否状態 ＋ SOS要請
+                  myStatusCard(),
+                  const SizedBox(height: 16),
+
+                  // 2. 方角コンパス
+                  const CompassWidget(),
+                  const SizedBox(height: 16),
+
+                  // 3. 【クイックアクション】オフライン伝言QR
+                  offlineRelayQrCard(),
+                  const SizedBox(height: 16),
+
+                  // 4. 現在地・バッテリー状況
+                  myLocationCard(),
+                  const SizedBox(height: 16),
+
+                  // 5. 読み取った災害情報
+                  relayedPeopleCard(),
+                  const SizedBox(height: 16),
+
+                  // 6. 友達登録 ＆ 友達一覧
+                  friendRegisterCard(),
+                  const SizedBox(height: 16),
+                  friendListCard(),
+                  const SizedBox(height: 16),
+
+                  // 7. 端末プロフィール設定（折りたたみ化）
+                  Card(
+                    elevation: 0,
+                    color: Colors.white,
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(12),
+                      side: BorderSide(color: Colors.grey.shade300),
+                    ),
+                    child: ExpansionTile(
+                      leading: const Icon(Icons.person_outline, color: Colors.black54),
+                      title: const Text(
+                        '端末・プロフィール設定',
+                        style: TextStyle(
+                          fontSize: 14,
+                          fontWeight: FontWeight.w600,
+                          color: Colors.black87,
+                        ),
+                      ),
+                      children: [
+                        Padding(
+                          padding: const EdgeInsets.all(12.0),
+                          child: myProfileCard(),
+                        ),
+                      ],
+                    ),
+                  ),
+
+                  const SizedBox(height: 40),
+                ],
+              ),
+            ),
+          ),
         ),
       ),
     );
@@ -2467,5 +2527,85 @@ class _HostPageState extends State<HostPage> {
         ],
       ),
     );
+  }
+}
+
+
+// コンパス表示用Widget
+class CompassWidget extends StatelessWidget {
+  const CompassWidget({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return StreamBuilder<CompassEvent>(
+      stream: FlutterCompass.events,
+      builder: (context, snapshot) {
+        if (snapshot.hasError) {
+          return const Text('センサーエラーが発生しました');
+        }
+
+        if (snapshot.connectionState == ConnectionState.waiting) {
+          return const CircularProgressIndicator();
+        }
+
+        // 方位角（北を0度とした角度）を取得
+        final double? heading = snapshot.data?.heading;
+
+        if (heading == null) {
+          return const Text('端末のコンパスセンサー非対応（またはWeb環境）です');
+        }
+
+        // ラジアンへ変換
+        final double headingRad = heading * (math.pi / 180);
+
+        return Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text(
+              '${heading.toStringAsFixed(0)}° ${_getDirectionName(heading)}',
+              style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+            ),
+            const SizedBox(height: 8),
+            Transform.rotate(
+              angle: -headingRad,
+              child: Stack(
+                alignment: Alignment.center,
+                children: [
+                  Container(
+                    width: 120,
+                    height: 120,
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      border: Border.all(color: Colors.indigo, width: 3),
+                    ),
+                  ),
+                  const Positioned(
+                    top: 6,
+                    child: Text('N', style: TextStyle(fontWeight: FontWeight.bold, color: Colors.red)),
+                  ),
+                  const Icon(
+                    Icons.navigation,
+                    size: 60,
+                    color: Colors.indigo,
+                  ),
+                ],
+              ),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  String _getDirectionName(double heading) {
+    if (heading >= 337.5 || heading < 22.5) return '北';
+    if (heading >= 22.5 && heading < 67.5) return '北東';
+    if (heading >= 67.5 && heading < 112.5) return '東';
+    if (heading >= 112.5 && heading < 157.5) return '南東';
+    if (heading >= 157.5 && heading < 202.5) return '南';
+    if (heading >= 202.5 && heading < 247.5) return '南西';
+    if (heading >= 247.5 && heading < 292.5) return '西';
+    if (heading >= 292.5 && heading < 337.5) return '北西';
+    return '';
   }
 }
