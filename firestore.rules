@@ -10,10 +10,19 @@ service cloud.firestore {
       return /databases/$(database)/documents/admins/$(request.auth.uid);
     }
 
+    function accountRolePath() {
+      return /databases/$(database)/documents/accountRoles/$(request.auth.uid);
+    }
+
     function isAdmin() {
-      return signedIn()
-        && exists(adminPath())
-        && get(adminPath()).data.enabled == true;
+      return signedIn() && (
+        (exists(adminPath()) && get(adminPath()).data.enabled == true)
+        || (
+          exists(accountRolePath())
+          && get(accountRolePath()).data.role == 'admin'
+          && get(accountRolePath()).data.status == 'approved'
+        )
+      );
     }
 
     function accessPath() {
@@ -43,24 +52,20 @@ service cloud.firestore {
         && exists(userPath(friendId))
         && get(userPath(friendId)).data.authUid is string
         && exists(targetAccessPath(get(userPath(friendId)).data.authUid))
-        && get(
-          targetAccessPath(get(userPath(friendId)).data.authUid)
-        ).data.friendIds is list
+        && get(targetAccessPath(get(userPath(friendId)).data.authUid)).data.friendIds is list
         && currentAppUserId() in get(
           targetAccessPath(get(userPath(friendId)).data.authUid)
         ).data.friendIds;
-    }
-
-    function isRescueSharing(userId) {
-      return exists(userPath(userId))
-        && get(userPath(userId)).data.rescueRequest == true;
     }
 
     function canReadLocation(userId) {
       return isAdmin() || (signedIn() && (
         (hasAccessRecord() && currentAppUserId() == userId)
         || isFriend(userId)
-        || isRescueSharing(userId)
+        || (
+          exists(userPath(userId))
+          && get(userPath(userId)).data.rescueRequest == true
+        )
       ));
     }
 
@@ -72,7 +77,7 @@ service cloud.firestore {
 
     match /users/{userId} {
       allow get, list: if isAdmin() || (signedIn() && (
-        (resource != null && resource.data.authUid == request.auth.uid)
+        resource.data.authUid == request.auth.uid
         || isFriend(userId)
         || resource.data.rescueRequest == true
       ));
@@ -93,7 +98,7 @@ service cloud.firestore {
       allow get: if signedIn() && request.auth.uid == authUid;
       allow list, delete: if false;
 
-      allow create, update: if signedIn()
+      allow create: if signedIn()
         && request.auth.uid == authUid
         && request.resource.data.authUid == authUid
         && request.resource.data.userId is string
@@ -105,15 +110,49 @@ service cloud.firestore {
         && get(
           /databases/$(database)/documents/users/$(request.resource.data.userId)
         ).data.authUid == authUid;
+
+      allow update: if signedIn()
+        && request.auth.uid == authUid
+        && resource.data.authUid == authUid
+        && request.resource.data.authUid == authUid
+        && request.resource.data.userId == resource.data.userId
+        && request.resource.data.friendIds is list
+        && request.resource.data.friendIds.size() <= 200
+        && request.resource.data.keys().hasOnly([
+          'authUid', 'userId', 'friendIds', 'updatedAt'
+        ])
+        && get(
+          /databases/$(database)/documents/users/$(request.resource.data.userId)
+        ).data.authUid == authUid;
     }
 
-    // Admin membership is provisioned out of band; clients can only inspect their own grant.
+    // Existing role requests are retained. Elevated roles remain manually provisioned.
+    match /accountRoles/{userId} {
+      allow get: if signedIn() && request.auth.uid == userId;
+      allow list: if false;
+      allow create: if signedIn()
+        && request.auth.uid == userId
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.role == 'guest'
+        && request.resource.data.requestedRole in ['guest', 'rescue', 'admin']
+        && (
+          (
+            request.resource.data.requestedRole == 'guest'
+            && request.resource.data.status == 'approved'
+          )
+          || (
+            request.resource.data.requestedRole in ['rescue', 'admin']
+            && request.resource.data.status == 'pending'
+          )
+        );
+      allow update, delete: if false;
+    }
+
     match /admins/{authUid} {
       allow get: if signedIn() && request.auth.uid == authUid;
       allow list, create, update, delete: if false;
     }
 
-    // QR中継情報はログイン済みユーザー間で共有し、中継を書いた本人だけ更新できます。
     match /relay_latest/{sourceUserId} {
       allow read: if canReadLocation(sourceUserId);
       allow create, update: if isOwnRelay(request.resource.data)
@@ -128,6 +167,11 @@ service cloud.firestore {
       allow create, update: if isOwnRelay(request.resource.data)
         && canReadLocation(request.resource.data.sourceUserId);
       allow delete: if isOwnRelay(resource.data);
+    }
+
+    // The integrated app does not use this legacy collection; deny access until its schema is reviewed.
+    match /locations/{locationId} {
+      allow read, write: if false;
     }
 
     match /{document=**} {

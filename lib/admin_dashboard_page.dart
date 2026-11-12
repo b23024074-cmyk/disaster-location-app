@@ -27,20 +27,25 @@ class _AdminDashboardPageState extends State<AdminDashboardPage> {
     final user = FirebaseAuth.instance.currentUser;
     if (user == null) throw StateError('ログインが必要です。');
 
+    final accountRoleDoc = await FirebaseFirestore.instance
+        .collection('accountRoles')
+        .doc(user.uid)
+        .get(const GetOptions(source: Source.server));
+    final roleData = accountRoleDoc.data();
+    final hasApprovedAdminRole =
+        roleData?['role'] == 'admin' && roleData?['status'] == 'approved';
+
     final adminDoc = await FirebaseFirestore.instance
         .collection('admins')
         .doc(user.uid)
         .get(const GetOptions(source: Source.server));
-    if (!adminDoc.exists) {
+    final hasLegacyAdminGrant =
+        adminDoc.exists && adminDoc.data()?['enabled'] == true;
+
+    if (!hasApprovedAdminRole && !hasLegacyAdminGrant) {
       throw _NotAdminException(
         uid: user.uid,
-        detail: 'このUIDの管理者ドキュメントが見つかりません。',
-      );
-    }
-    if (adminDoc.data()?['enabled'] != true) {
-      throw _NotAdminException(
-        uid: user.uid,
-        detail: 'enabled がBoolean型の true ではありません。',
+        detail: 'accountRoles または admins に有効な管理者権限がありません。',
       );
     }
 

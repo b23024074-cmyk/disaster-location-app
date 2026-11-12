@@ -8,12 +8,15 @@
 - PMTilesを使う沖縄オフライン地図、日本語フォント、地図用タイル資産
 - 管理者一覧から対象者のオフライン地図を開く機能
 - 管理者画面の「電池20%以下」絞り込み
-- 現在のアプリで使っているFirestoreルール
+- `accountRoles` の既存ゲスト申請と、承認済み管理者ロール
+- Firestoreの `users`、`user_access`、中継データ用ルール
 
 ## Firebaseについて
 
-このブランチでは、相手側リポジトリの `lib/firebase_options.dart`、`android/app/google-services.json`、Firebaseプロジェクト設定を維持しています。したがって、アプリコードを入れただけでは、現在の `yambaru-last-signal-2` のFirestoreデータは移行されません。
+アプリのFirebase設定は相手側の `disaster-location-app` プロジェクトのままです。ルールは2026-11-12に同プロジェクトへ公開済みです。
 
-アプリを動かす前に、対象FirebaseプロジェクトでAuthenticationの匿名認証・メール/パスワード認証を有効にし、Firestoreルールと `users`、`user_access`、`admins`、`relay_latest`、`relay_history` のデータ構造を確認してください。既存ユーザーのFirebase UIDとアプリ内ユーザーIDの対応を移行せずにルールだけ適用すると、位置や安否情報を読み書きできない場合があります。
+以前のルールは `users` と `locations` を未ログインでも読み書きできる状態でした。新しいルールでは、位置情報やプロフィールのアクセスを認証・所有・友達・救助要請・管理者の条件で制限します。統合アプリで使っていない `locations` コレクションは、スキーマを確認するまでアクセス拒否にしています。`accountRoles` の既存ゲスト申請は維持し、承認済みadminロールを管理者として認識します。
 
-Firestoreルールのデプロイやユーザーデータのコピーは、このブランチ作成では実行していません。
+## データ移行状況
+
+`yambaru-last-signal-2` からのFirestoreデータコピーはまだ行っていません。認証アカウントの引き継ぎと、`user_access` / `users` のID対応を確認してからプロフィールを移してください。友達IDやQR中継履歴は、移行先のユーザーIDが確定してから扱ってください。
