@@ -13,10 +13,10 @@
 
 ## Firebaseについて
 
-アプリのFirebase設定は相手側の `disaster-location-app` プロジェクトのままです。ルールは2026-11-12に同プロジェクトへ公開済みです。
+統合アプリは `yambaru-last-signal-2` を使用する設定に変更しました。Androidパッケージ `com.example.my_app` を元プロジェクトへFirebaseアプリとして登録し、Webは元プロジェクトの既存Firebaseアプリ設定を使います。`disaster-location-app` のFirestoreデータやAuthアカウントは変更・削除していません。
 
-以前のルールは `users` と `locations` を未ログインでも読み書きできる状態でした。新しいルールでは、位置情報やプロフィールのアクセスを認証・所有・友達・救助要請・管理者の条件で制限します。統合アプリで使っていない `locations` コレクションは、スキーマを確認するまでアクセス拒否にしています。`accountRoles` の既存ゲスト申請は維持し、承認済みadminロールを管理者として認識します。
+統合アプリのFirestoreルールは、元プロジェクト側の `firestore.rules` に揃えています。ルールを元プロジェクトへデプロイしてはいません。元プロジェクトで既に適用されているルールがアプリのアクセスを許可することを確認してから、必要であれば別途デプロイしてください。
 
 ## データ移行状況
 
-`yambaru-last-signal-2` からのFirestoreデータコピーはまだ行っていません。認証アカウントの引き継ぎと、`user_access` / `users` のID対応を確認してからプロフィールを移してください。友達IDやQR中継履歴は、移行先のユーザーIDが確定してから扱ってください。
+アプリは元プロジェクトの既存FirestoreとAuthenticationを直接使用します。そのためFirestoreデータのコピーは不要です。`disaster-location-app` に作成したFirestoreルールは残っていますが、現在のアプリ設定では使用しません。

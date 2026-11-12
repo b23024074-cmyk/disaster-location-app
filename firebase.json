@@ -1,25 +1,42 @@
 ﻿{
+    "firestore":  {
+                      "rules":  "firestore.rules"
+                  },
     "flutter":  {
                     "platforms":  {
                                       "android":  {
                                                       "default":  {
-                                                                      "projectId":  "disaster-location-app",
-                                                                      "appId":  "1:537300321237:android:4066cdfa640b6172fe735c",
+                                                                      "projectId":  "yambaru-last-signal-2",
+                                                                      "appId":  "1:28349591057:android:9dbc3d70b660af37c40bb0",
                                                                       "fileOutput":  "android/app/google-services.json"
                                                                   }
                                                   },
                                       "dart":  {
                                                    "lib/firebase_options.dart":  {
-                                                                                     "projectId":  "disaster-location-app",
+                                                                                     "projectId":  "yambaru-last-signal-2",
                                                                                      "configurations":  {
-                                                                                                            "android":  "1:537300321237:android:4066cdfa640b6172fe735c",
-                                                                                                            "web":  "1:537300321237:web:d37027a1a7e3d5bffe735c"
+                                                                                                            "android":  "1:28349591057:android:9dbc3d70b660af37c40bb0",
+                                                                                                            "ios":  "1:28349591057:ios:6e5ededcd50be646c40bb0",
+                                                                                                            "macos":  "1:28349591057:ios:6e5ededcd50be646c40bb0",
+                                                                                                            "web":  "1:28349591057:web:bbbee546041f8166c40bb0",
+                                                                                                            "windows":  "1:28349591057:web:51ee3e523e6333cec40bb0"
                                                                                                         }
                                                                                  }
                                                }
                                   }
                 },
-    "firestore":  {
-                      "rules":  "firestore.rules"
-                  }
+    "hosting":  {
+                    "public":  "build/web",
+                    "ignore":  [
+                                   "firebase.json",
+                                   "**/.*",
+                                   "**/node_modules/**"
+                               ],
+                    "rewrites":  [
+                                     {
+                                         "source":  "**",
+                                         "destination":  "/index.html"
+                                     }
+                                 ]
+                }
 }
