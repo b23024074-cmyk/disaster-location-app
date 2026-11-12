@@ -1,0 +1,57 @@
+name: flutter_map_vector_tiles
+description: >-
+  Vector tiles for flutter_map: a clean, self-contained MapLibre-style
+  vector tile layer with isolate-based decoding, raster tile caching and
+  screen-space label collision.
+version: 2.10.1
+repository: https://github.com/JonasGrunau/flutter-map-vector-tiles
+issue_tracker: https://github.com/JonasGrunau/flutter-map-vector-tiles/issues
+topics:
+  - flutter-map
+  - vector-tiles
+  - maplibre
+  - map
+  - pmtiles
+
+screenshots:
+  - description: >-
+      Munich old town at street level, rendered live from the OpenFreeMap
+      Liberty vector style.
+    path: screenshots/munich-liberty-framed.webp
+  - description: >-
+      Zermatt in the Alps — an Esri hillshade raster source blended into the
+      vector style shows the terrain.
+    path: screenshots/zermatt-hillshade-framed.webp
+  - description: >-
+      Munich in OpenFreeMap's Fiord style — dark mode comes free with any
+      dark vector style.
+    path: screenshots/munich-dark-framed.webp
+
+platforms:
+  android:
+  ios:
+  linux:
+  macos:
+  web:
+  windows:
+
+environment:
+  sdk: ">=3.6.0 <4.0.0"
+  flutter: ">=3.27.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  characters: ^1.3.0
+  flutter_map: ^8.2.0
+  http: ^1.2.0
+  latlong2: ">=0.9.1 <0.11.0"
+  meta: ^1.11.0
+  path_provider: ^2.1.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+
+flutter: {}

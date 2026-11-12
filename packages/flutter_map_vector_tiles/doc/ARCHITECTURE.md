@@ -1,0 +1,1016 @@
+# Architecture
+
+`flutter_map_vector_tiles` is a clean-room rewrite of the ideas behind
+`vector_map_tiles`, designed for flutter_map ≥ 8 and modern Flutter
+(Impeller). It is a single self-contained package: MVT decoding, the
+MapLibre style engine, the tile pipeline and rendering all live here.
+
+## Data flow
+
+```
+style.json ──► StyleReader ──► Theme (compiled layers + expressions)
+                                  │
+camera ──► TileGrid (visible display tiles at floor(zoom))
+                                  │
+display tile (z,x,y) ─► data tile key (clamped to source maxZoom)
+     │
+     ├─ TileStore (memory LRU of PreparedTile)
+     │      └─ miss: bytes ◄─ DiskCache ◄─ VectorTileProvider (network…)
+     │                 (providers backed by local storage skip DiskCache)
+     │              └─ IsolatePool: decode MVT, trim to what the theme reads
+     │                             └─ PreparedTile (compact, transferable)
+     │
+     ├─ TileRasterizer: PreparedTile ─► ui.Picture ─► toImageSync (GPU)
+     │       one raster per *display* tile at tileSize·dpr, evaluated at
+     │       the display zoom (crisp overzoom via subdivision, not scaling);
+     │       features are culled — and at deep overzoom clipped — to the
+     │       tile's window of the data tile
+     │
+     └─ symbols: SymbolLayouter collects label/icon anchors per tile
+             ├─ LabelPainter: per-frame screen-space pass, global collision
+             │  grid across all tiles, upright text under rotation
+             └─ or, LabelMode.tile: LabelPainter.paintTile places them once
+                per tile and draws them into the tile's own image
+```
+
+Rasterization and symbol extraction are two separate jobs in a budgeted
+per-frame render pump (rasters for every pending tile first, symbols
+after — in `LabelMode.tile`, one tile at a time, since a tile shows only
+once both are done). Both are resumable — a recording stops between
+style layers, shaping between labels — so a dense tile is spread over
+several frames. What is never split can still fill a frame on its own:
+one style layer's recording, and in `LabelMode.tile` one tile's label
+placement, drawing and snapshot (see below). A finished tile — image
+plus symbols — enters the shared result cache, so re-crossing a zoom
+level skips the pipeline entirely. The pump's stages emit DevTools
+timeline events (`VT render pump`, `VT rasterize`, `VT symbols`,
+`VT labels`, and in `LabelMode.tile` `VT rasterize with labels` and
+`VT tile labels`).
+
+## Rendering model
+
+Geometry (background/fill/line) is rasterized **once** per display tile
+into a GPU-resident `ui.Image` via `Picture.toImageSync`; the per-frame
+cost of pan/zoom/rotate is just textured quads, like a raster tile layer.
+Between integer zooms the images scale (max 2×) exactly as raster maps
+do; on crossing a zoom level, new display tiles are rasterized from the
+already-decoded data tile, while the previous zoom's images are retained
+and drawn underneath until replacements are ready (no white flicker).
+The retained level is released the moment every current tile is
+rendered and faded in — checked from the publish jobs and the fade
+ticker, not only from rebuilds, because a crossing whose gesture has
+ended produces no further builds and would otherwise keep the outgoing
+level in memory (and painted beneath the map) until the next one. A
+tile's fade-in itself runs only where it can cross-fade: a tile served
+from the finished-result cache with retained imagery beneath it fades
+over that imagery, while one with nothing beneath — the ring a zoom-out
+exposes — appears at full opacity at once, because a fade there runs
+over the bare background and reads as a background-coloured shimmer on
+every crossing. Freshly rasterized tiles always fade; their fade is
+what masks staggered pop-in.
+
+Recording that geometry into a `Picture` is the expensive half of the
+raster phase, and it is all UI-thread work: on a Nothing Phone (1), a
+display tile of central Berlin at z16 took 16–28 ms to record, up to
+49 ms, against a 16.7 ms frame — buildings and dashed footpaths about
+half of it. So the raster phase is resumable, like the symbol phase:
+`TileRasterizer.recordSlice` records layers until the pump's budget is
+spent and returns where to resume, the job keeps the slices it has
+(`_RenderJob.geometryParts`) and is requeued with its priority, ahead
+of the jobs it ties with — otherwise tiles of one priority, such as
+every tile a refresh re-renders, would take turns a slice each and none
+would finish until all had started — and once the last layer is in, `compose` stacks the slices into exactly the
+picture a single recording would have made. A layer is the smallest
+unit — each is drawn whole, in order, with its own paints, which is
+what keeps the slices stackable — so one frame can still carry the most
+expensive layer of a tile: 5–9 ms on those Berlin tiles, 22 ms for the
+buildings of the densest one. Nothing is published before the last
+slice: a tile halfway through its recording counts as loading, and
+whatever covered it keeps covering it. A slice taken at a different
+pixel ratio than the ones before it starts the recording over, since
+it would not stack onto them; the other inputs cannot change under a
+job — a theme change empties the queue, and a change that re-renders
+the live tiles (sprites, `showLabels`, the label mode, the resume
+recovery) retires the outgoing level's queued jobs too. The symbol phase inherits
+the ratio the geometry was recorded at — `LabelMode.tile` draws the
+labels over that geometry at it — and a tile finished at a ratio the
+screen has since left is published but not cached, so the next visit
+renders it afresh.
+
+The budget depends on motion: 4 ms per frame while the camera moves,
+12 ms once it has stood still for 150 ms. While the map moves, every
+late frame is a visible stutter; while it stands still, a late frame
+only puts a fade-in one frame behind, and slicing at 4 ms then left
+most of each frame idle — the first complete map came 3 s later than
+before slicing. The one casualty of the still budget is an animation
+the app runs over a still map that is still loading: 12 ms is most of
+a 60 Hz frame and more than a 120 Hz one, so that animation can drop
+frames until the tiles are in.
+
+Measured with `compare/` on that phone at 60 Hz, two runs each, panning
+and zooming over the same tiles: with `LabelMode.tile` the map got a
+frame on 95–98% of display refreshes while panning (84–89% before) and
+94–96% while zooming (85–93%), the first complete map came after 1.0 s
+instead of 3.8 s, and the tiles came out pixel-identical. The default
+`LabelMode.screen` delivered the same share of frames as before — its
+per-frame label pass, not recording, is what makes those frames late —
+but its first complete map also came after 1.1–1.2 s instead of
+3.0–3.1 s. The price is the backlog a moving camera leaves: in tile mode
+the last tiles land up to 0.2 s after a pan stops, 0.9 s after a long zoom,
+where before the screen was complete the moment the camera stopped —
+because every frame of the motion had waited for whole tiles.
+
+A move is picked up from flutter_map's map events (`MapEventWithMove`,
+size changes excepted, since the first layout fires one too), not only
+in `build`. Tickers run before the build phase, so `build` sees a move
+only after that frame's pump has already run on the still budget; the
+event arrives before the frame starts, so the first frame of a drag or
+zoom over a still, loading map already gets 4 ms.
+
+A display tile whose data has not arrived does not wait blank. While
+the load is pending, the layer renders a *provisional* image from
+whatever the decoded-tile cache can offer: the nearest in-memory
+ancestor (up to five levels up — a fast zoom-in instantly shows a
+window of the parent it just left), or, when there is no cached
+ancestor because the camera zoomed *out* — the level just left lies
+below the pending key — its cached descendants, up to two levels down,
+each shrunk into its sub-square of the display tile and clipped to its
+own extent so buffer geometry cannot spill into a sub-square whose
+descendant is missing. The descendant cover may be partial; partially
+sharp pixels still beat the background. Descendants contribute
+geometry only — symbols are never laid out from them, so labels arrive
+with the tile's real data. Provisional results never enter the result
+cache, and a provisional tile still counts as loading for retention.
+
+At overzoom — display zoom past the source's maxzoom — each display tile
+shows only a small window of its data tile. Features are rejected
+against that window (expanded by a 64-logical-px buffer) using bounds
+computed once at decode time, *before* any paint expression or
+per-tile filter runs; from two levels of overzoom the surviving geometry is additionally
+clipped to the window, with dash and line-pattern phase measured from
+the original run start so patterns stay aligned across clip boundaries
+and display-tile seams. Rasterization cost per display tile is therefore
+bounded by what is visible, not by the density of the data tile — the
+difference between ~1 ms and ~85 ms per tile for a dense city tile
+viewed at z20 over z14 data.
+
+Layer filters are resolved once per data tile, not once per display
+tile. A style runs many layers over one source layer — a MapTiler
+theme has 60+ line layers over `transportation` alone — and every one
+of them used to test every feature again on each display tile cut from
+the data tile: 45 filter tests per match, measured on a phone. The
+expression parser records whether a filter can read the zoom
+(`["zoom"]` anywhere in it, or a zoom-keyed legacy function inside
+it). One that cannot selects the same features at every zoom, so the
+rasterizer and the symbol layouter take its matches from a list
+computed on first use and attached to the `PreparedSourceLayer`
+(`render/matched_features.dart`): it lives exactly as long as the
+prepared tile, and a swapped theme's layers simply miss. Both levels of
+that cache are weak — an `Expando` per source layer, holding an
+`Expando` per style layer — so a theme that has been swapped out, a
+light and a dark style taking turns say, is not kept alive by the
+decoded tiles it was drawn from, and neither are its match lists. Only
+zoom-reading filters are still evaluated per display tile; the type
+filter and the bounds cull above still run per display tile, over the
+matches. That cut rasterization time per tile by a third to almost
+half on a phone in the z15.5–17.5 band, where one z14 data tile serves
+up to 64 display tiles.
+
+By default (`LabelMode.screen`) labels and icons are **not** baked into
+the tile images. They are drawn each frame in screen space:
+
+* text stays crisp at fractional zoom and upright under map rotation;
+* collision detection runs globally across tile borders, so labels never
+  duplicate or clip at tile seams;
+* fade transitions don't require re-rasterizing geometry;
+* a symbol layer's `minzoom`/`maxzoom` is enforced per frame at the
+  fractional style zoom (per-tile layout only prefilters by the integer
+  zoom band), so labels appear and disappear exactly at the style's
+  thresholds — including labels still painted from retained
+  previous-level tiles during a zoom crossing.
+
+Text is shaped **once per unique label at a 16 px reference size** and
+drawn through the canvas transform at the evaluated `text-size` — valid
+because every layout input is em-proportional, and crisp because glyphs
+rasterize at device scale under the transform. The drawn scale is
+snapped down so the device font size lands on a whole pixel (down, so
+drawn text never outgrows the box collision placed): Impeller keys
+its glyph atlas by the device text scale rounded to 1/200, so an
+unsnapped `text-size` ramp would hand it a new size at every eval-zoom
+step and re-rasterize every visible glyph and halo stroke on the raster
+thread. The shape-cache key
+therefore contains no font size; `text-opacity` (1/32 steps) and
+`text-halo-width` (1/128-em ratio steps) enter it quantized, so style
+ramps re-shape a label a bounded number of times ever rather than per
+zoom step. Never put a font size — or an unquantized opacity or halo
+width — back into that key: it re-creates the full-screen re-shape per
+pinch that this design removed. Collision boxes and curved-text cluster
+metrics are the reference-size measurements multiplied by the scale.
+
+Symbol layout applies the same decode-time bounds culling before
+evaluating any expressions, and along-line anchors keep their full-line
+spacing parametrization — an anchor lands at the same world position no
+matter which display tile lays it out — while being *enumerated* only
+inside the tile's window. The parametrization is `mid + k·spacing` from
+the line's midpoint, for every integer k. `symbol-spacing` is in display
+pixels, so one level deeper it spans half the world distance and the
+anchor set contains every anchor of the level above: over the same data
+(overzoom, and the provisional layout while a level loads) a street name
+keeps its exact world position across a crossing — for a
+`symbol-spacing` that does not change between the two levels, which is
+how styles almost always declare it (a zoom-dependent spacing re-spaces
+the line, and its anchors move with it). MapLibre's
+`spacing/2 + k·spacing` from the line start shares no anchor between two
+levels and moved every name by a quarter spacing at each crossing — the
+same nesting Google's "label crawling" patent (US8237745) reaches by
+bisecting from the midpoint. When the next level brings its own data
+tiles the clipped parts differ, the midpoint moves with them, and the
+fade tracker cross-fades the name as below. It runs as its own budgeted job after the
+tile's raster (skipped entirely when no symbol layer intersects the
+tile's zoom band),
+and the tile's label text is shaped into the caches before the first
+frame that can draw it, never during paint.
+
+Repeated line text is intentionally retained through tile layout and
+prewarming. MapLibre joins same-text lines end to end inside a tile before
+spacing them; doing that here would re-parametrize every street per data
+level and move its anchors at each crossing, so the duplicates are removed
+in the final screen-space placement pass instead. That pass, which already
+visits topmost layers first, applies a `symbol-spacing / 2` exclusion zone
+across style layers reading the same source layer — but only between
+anchors on the *same road*: the displacement between them must run along
+either one's line direction (its across-line component within one text
+height), so the split ways of one street suppress each other while a
+motorway's two carriageways, a street's neighbouring switchbacks and
+parallel same-named roads keep their labels. Anchors of one feature never
+suppress each other (the layouter already spaced them along the path), and
+retained previous-level candidates take no part in it — their spacing is the
+old level's, and suppressing the arriving level's copies would only hand
+them back as pop-ins when the level is released. Deferring the decision
+until placement means an exact-zoom-gated, transparent or
+collision-rejected candidate cannot erase a lower-priority fallback, and the
+screen-space index also spans tile boundaries. Point and `line-center`
+placement bypass the repeat index.
+
+Icons are likewise resolved in that screen-space pass. Map-aligned point
+icons include camera bearing; line-aligned icons add the projected line
+bearing. Rotation is about the symbol anchor, so `icon-anchor` and
+`icon-offset` rotate with the sprite, and the rotated extent is used for both
+collision and bounded fade layers.
+
+That shaping is the expensive half — several times a frame's whole
+render budget on a dense city tile, against sub-millisecond extraction —
+so the symbol phase is **resumable**: it extracts the candidates once,
+then shapes them in slices, checking the tick's budget between labels
+and requeueing itself with a cursor when the budget runs out. The pump's
+budget is therefore honoured *within* a job, not merely between jobs;
+before this, one dense tile could overrun the whole tick several times
+over, and there are a dozen such tiles in a crossing. A tile publishes
+nothing until its whole batch is shaped — the label pass shapes on a
+text-cache miss, so offering it a half-shaped tile would move the
+remaining cost straight into paint, which has no budget at all. A tile
+whose symbols are still pending counts as loading for the retention
+rules, so the previous level's labels cover the gap; newly appearing
+labels then fade in over `labelFadeDuration`, drawn in a few quantized
+opacity buckets (one translucent layer each, bounded to what that
+bucket paints) while reserving full-size collision space.
+
+Which labels fade — in *and* out — is decided per frame, per label, by
+`render/label_continuity.dart`. Every label carries a position-free
+continuity key, `(layer, text, icon)`, and a `LabelFadeTracker` inside
+the label painter holds one opacity per **sitting** — the key at a
+screen position, matched to the nearest tracked state within 32 px
+(`LabelFadeTracker.showAt`, the same radius the placement memory uses,
+refreshed on every sighting so a sitting follows the camera) — and
+integrates it toward "placed this frame ? 1 : 0", a wall-clock fraction
+of the fade per frame. Anything that appears eases in and anything that
+disappears eases out, whatever the cause: a tile arriving, a zoom
+crossing handing over to new tiles, a collision won or lost
+mid-gesture, a layer cut at its zoom threshold. There is no per-cause
+bookkeeping, no publish-time diff, and no moment at which the tile grid
+must be complete.
+
+The loose-key-plus-position-match shape carries the anti-blink
+guarantees. The *key* stays position-free because two zoom levels
+simplify geometry differently: the arriving level's copy of a label
+lands a fraction of a pixel from the outgoing one's, inside the match
+radius, so both resolve to one sitting, whichever copy wins collision
+draws at its opacity, and the swap is invisible — a label can never
+cross-fade against itself; an exact positional key would miss on that
+same noise and re-fade a label that never left. The *position match*
+splits what position genuinely separates: two POIs sharing a name, the
+housenumber "12" down a whole street, every parking icon on a layer,
+and the re-spaced repeats of an along-line name (whose anchors move
+when the next level brings differently clipped data, and which gain
+in-between repeats one level deeper) each fade on their own.
+With one state per key, a key still placed *anywhere* held every other
+copy at its opacity — so those copies appeared and vanished as hard
+pops, never fading at all, and a re-spaced street name teleported at
+full opacity instead of cross-fading. And direction changes resume
+rather than restart: a sitting re-placed mid-fade-out rises from where
+it is, so a label briefly unplaced (a republish, a lost frame of
+collision) dips at most one opacity step instead of blinking to zero.
+This is the fade half of MapLibre's `CrossTileSymbolIndex` — identity
+as text plus tolerance-matched anchor — expressed in the screen space
+the label pass already works in.
+
+A third property joined them when placement became purely
+interval-paced: **only a placement pass may start a fade-out**. Between
+passes the winner set is frozen by instance identity, and a tile
+republish or level hand-over replaces every instance — so an un-shown
+sitting on a replay frame usually means succession, not departure. Its
+ghost holds at its current opacity, drawn from whichever equivalent
+candidate is on offer, until the next due pass either adopts the
+successor (seamlessly, through the shared sitting) or confirms the loss
+and starts the fade. Decaying through that window instead made every
+label dim and re-brighten at every crossing — fading into itself, the
+artefact the shared sitting exists to prevent. A fade a pass has
+started advances every frame, held or not.
+
+Every label fades on **its own clock**, from the frame it is placed. The
+invariant that makes this safe is that a placed label always paints
+something: a key on its first frame has no elapsed fade time, so the
+painter floors it at one opacity step rather than letting it draw at
+zero. A no-fade paint clears the tracker immediately: when
+`labelFadeDuration` changes to zero during a fade, no stale active state
+remains to keep the widget's fade ticker scheduling frames indefinitely.
+
+That is worth stating as an invariant because 2.7.0 broke it and had to
+be reverted in 2.7.1. The reasoning then was that the pump publishes
+roughly one tile per frame, so a crossing hands the painter a screen's
+labels over tens of frames at as many different opacities — and each
+distinct opacity costs a `saveLayer` whose bounds are the union of its
+members', which for screen-scattered POI labels is the whole screen.
+Grouping arrivals into waves that shared one opacity took the peak from
+seven such passes per frame to two. But the raster thread it was meant
+to relieve had already measured clear on the device in question. A
+back-to-back A/B settled it: removing the waves *improved* UI-thread
+frame time (p99 6.67 ms → 4.93 ms) and moved the raster thread from
+1.63 ms to 1.93 ms at p99, against an 8.3 ms budget neither arm ever
+exceeded. There was nothing on the other side of the trade, while the
+cost was severe:
+
+* A label queued behind a wave sat at exactly zero, where one frame of
+  lost placement took `opacity -= step` below zero and dropped the key
+  entirely. It then re-arrived as brand new and queued again — during a
+  gesture, potentially forever. Measured over 120 frames, a label placed
+  on 80 of them painted on 2.
+* Because a label could only become visible when a wave *started*, a
+  steady stream of arrivals appeared in bursts one fade duration apart
+  rather than fading in continuously. That is what a zoom sweep
+  produces, and it read as flashing.
+* A queued label kept the collision space it had won while painting
+  nothing, so for up to a fade duration there was a hole in the map that
+  nothing else was permitted to fill.
+
+The frame-time win at a crossing came from the pump slicing and the
+cache sizing, both of which stand. The lesson to keep: a label that
+holds a spot must paint, and zero is not a safe resting opacity in a
+tracker whose sweep drops anything at or below zero.
+
+Fade-outs draw as **ghosts**. A sitting that stops being placed keeps
+being drawn for the length of its fade — from whatever instance of its
+key is still on offer, laid out past the zoom gate that may just have
+cut its layer — but claims no collision space. Whatever replaces the
+label therefore places (and fades in) immediately, over the ghost,
+instead of waiting for the fade to end and popping into the freed
+space. A sitting's ghost takes the candidate nearest it (bounded at
+twice the match radius, else it draws nothing) — never the
+priority-first candidate, which for a street with several repeats or a
+key several POIs share could be a different label entirely,
+teleporting the ghost. When a retained
+tile is disposed while keys from it may still be fading, its symbols
+are parked for one fade duration as ghost-only fallbacks (plain Dart
+objects — no tile texture is pinned by a fade).
+
+Retention feeds the tracker; it no longer decides fades. Retained
+previous-level tiles keep offering their labels as ordinary candidates
+while an overlapping current tile still lacks final label data (a tile
+whose symbols are pending counts as loading, and provisional
+ancestor-data cohorts do not count as coverage), and as ghost-only
+fallbacks afterwards. One rule of the retention window remains, the
+**pin**: the crossing that moves a level into retention cuts its
+cohorts to what the last frame actually drew (`drawnLabels` against
+`_drawnLastFrame` — candidates that were losing collision are dropped
+for good). An outgoing level exists to keep what was visible, never to
+introduce labels: a crossing typically cuts whole symbol layers at
+their `minzoom` — POIs, say — and without the pin the freed space would
+go, mid-transition, to labels never before on screen, purely for the
+arriving level to fade them back out.
+
+**Placement itself is throttled.** The collision pass does not run every
+frame: it runs once per `labelFadeDuration` (capped at 300 ms), and the
+frames in between replay its decision — layout still follows the camera,
+only *who is shown* is frozen, and the replay claims no collision space
+at all. Deciding afresh every frame samples every transient a gesture
+produces: label boxes scale with the zoom and swing with the rotation,
+so neighbours drift through each other constantly, and a label that lost
+its spot for three frames disappears and comes straight back. Fading
+those changes makes them smoother but not fewer — the fix is to observe
+the decision less often than the camera changes it, which is what
+MapLibre does, at the price of a little transient overlap between
+passes. Camera motion and changed candidates (tiles published or
+expired) advance a placement generation; if the interval has not
+elapsed, that generation waits for the next due pass — at most one fade
+duration, the time a new label's fade-in takes anyway. A crossing churns
+the candidate set every few frames, so placing on each churn would be a
+10 ms+ collision pass several times a second on a symbol-heavy style.
+Only a viewport resize places at once; replaying a decision taken for
+another screen misplaces everything. A replay frame sorts only the last
+pass's winners — on a dense screen about a hundred of a few thousand
+candidates; the rest go straight to the fade-out fallbacks. The
+priority order is total (insertion order breaks every tie), so the
+winners come out exactly as a full sort would order them; sorting
+everything cost 2.7 ms per frame on a phone during fast sweeps.
+
+Curved text draws from a glyph atlas (`glyph_atlas.dart`). Each
+grapheme is rasterized once per style and snapped device size onto a
+1024² page, and a curved label then draws in one `drawRawAtlas` call for
+its halos and one for its fills. Drawn as paragraphs, every glyph cost a
+save, translate, rotate, scale, paint and restore, twice, which was most
+of the label draw time on the UI thread and one text entity per glyph
+on the raster thread. New glyphs are batched into one snapshot per page
+per frame. When all pages are full, the least recently used page that
+the current frame has not drawn from is emptied and reused. Atlas pages
+are `toImageSync` rasters, so the layer stops new glyphs from being
+rasterized while the app is away and clears the atlas in its resume
+recovery. A label with a glyph missing from the atlas draws glyph by
+glyph as before.
+
+A replay must not overturn the pass through the back door either.
+Curved text is rejected when the line bends past `text-max-angle` under
+it or when the text no longer fits along its line, and both depend on
+the zoom, which a replay frame and a fade-out ghost see changing every
+frame. So on the permissive index they never drop a label: the bend
+check is skipped, and text that outgrew its line is drawn straight at
+its anchor until the next pass decides. Re-judged per frame, a winner
+whose bend or length sat near the limit vanished for a frame or two —
+and its ghost with it, since the ghost runs the same check — and on
+every zoom-out, street names whose text outgrew their stretch of road
+popped out at full opacity. On a pass, a label already on screen keeps
+its seat up to a quarter more bend than a newcomer may take, so a
+sitting near the limit does not toggle as the zoom drifts across it.
+
+`text-max-angle` limits the turn between neighbouring glyphs, and the
+reading direction (`text-keep-upright`) is chosen once per label from
+the chord between its ends, as in MapLibre. A road that turns back on
+itself, such as Petersplatz in Munich looping round its church, can pass
+the first at every step and still leave the glyphs past the turn upside
+down. So a kept-upright curved label also has no glyph more than 30°
+past vertical on screen (`_uprightSlack`): a pass rejects one that
+would, and a replay or ghost draws it straight at its anchor, the same
+as text that outgrew its line. The painter reports a pending pass
+only while the latest generation differs from the one it placed, and the
+fade ticker paints until that pass runs. The final settling repaint sees
+the same generation and creates no new debt, allowing the ticker to stop
+on an unchanged map.
+
+**Placement passes prefer incumbents.** Candidate priority is topmost
+style layer, then incumbency, then `symbol-sort-key`, then screen y,
+then insertion order — where an incumbent is a candidate whose label is
+steadily visible right now (last pass's winners by instance identity,
+plus any candidate matching a full-opacity fade sitting, which is what
+carries incumbency across the instance replacement every republish and
+level swap performs). A same-layer arrival therefore never evicts a
+visible label — it waits for space to be genuinely free — while a
+higher style layer still wins, keeping the style author's hierarchy.
+Without this, every crossing let the arriving level's re-ranked
+candidates evict visible labels and hand the space back half a level
+later: the visible→hidden→visible twitch. MapLibre has no equivalent —
+its passes re-elect winners from scratch in deterministic order, and
+fades only smooth the churn — so this is a deliberate divergence, and
+`bench/`'s stability mode exists to measure it (`blink` counts).
+
+Three placement choices are remembered so that a pass reproduces the
+last one rather than re-deriving it from scratch — each is a spot where
+an arbitrary tie-break used to move a label that had no reason to move:
+
+* **Which candidate draws a label.** A street name reaches the pass more
+  than once (the two carriageways of one road; the outgoing and arriving
+  copy at a zoom crossing), and which one sorts first depends on their
+  screen y — so a slow pan walked the name across the street. The
+  copy already drawn is tried ahead of the others *of its own label*
+  (`_promoteIncumbents`, distinct from the cross-label incumbency term
+  above: this one only reorders candidates within one continuity key).
+* **Which `text-variable-anchor` it sits at.** Anchors are tried in
+  style order, except the one the label is already at, which is tried
+  first: a neighbour brushing past no longer pushes a label to its
+  second choice and back.
+* **Which way an along-line label reads.** The bare test — is the
+  label's end left of its start — has its threshold exactly where a road
+  runs vertical on screen, where the answer is a pixel of camera noise;
+  a road near vertical flipped its label on alternate frames, and since
+  a perpendicular `text-offset` is measured in the label's own frame,
+  each flip also mirrored the label to the other side of the street. The
+  decision now holds until the line is clearly (≈4.6°) past vertical.
+
+The last two live in a **placement memory** on the painter, keyed by
+continuity key *and* screen position, rather than on the
+`SymbolInstance`. Instances are built per display-tile layout, so a zoom
+crossing, a provisional→final swap or any re-layout hands the painter a
+brand-new object for a street that never left the screen; state kept on
+the instance dies exactly there, and since the continuity key is
+unchanged the arriving copy's cold decision lands at full opacity, with
+no crossfade to cover it. Entries are matched to the nearest sighting
+within 32 px and refreshed every painted frame, so a label moves only as
+far as the camera does between frames, and the repeats of one name along
+a single street (`symbol-spacing`, 250 px by default) keep their own.
+
+Position belongs in *that* key and not in the continuity key, because
+the two answer different questions and fail in opposite directions. A
+missed match costs a *fade* the blink it exists to prevent, so the
+continuity key errs loose; for a *decision* a loose key is what does the
+damage — every same-named street would share one side of the road —
+while a missed match merely decides cold. This is the useful core of
+MapLibre's `CrossTileSymbolIndex`, which matches symbols across zoom
+levels by position for much the same reason. The index proper is not
+worth porting: it exists to give MapLibre's per-tile placement a
+cross-tile identity, which a screen-space pass over every level's
+candidates at once already has.
+
+Symbols also ramp out over the last quarter zoom level before their
+layer's declared `maxzoom`, so zooming past a threshold dissolves a label
+instead of snapping it away. The ramp is a function of zoom alone — no
+per-symbol history, and exactly reversible — and lives *inside* the
+range, reaching zero at the threshold where the hard cut takes over.
+Only `maxzoom` ramps: `minzoom` is inclusive, so a symmetric ramp would
+leave a `minzoom: 14` layer invisible on a map resting at exactly zoom
+14. The ramp may dim a symbol the style is about to remove, never one
+the style says is fully visible. The per-frame
+label pass evaluates at a zoom quantized to 1/8-level steps, so the
+per-instance style memos — which compare evaluated primitives, not
+strings — keep hitting on every frame of a pinch gesture instead of
+missing on every fractional zoom change. Layer visibility is gated on
+the *exact* fractional zoom rather than that quantized value: rounding a
+size costs a fraction of a pixel, while rounding a discrete cut moves it
+by up to 1/16 of a level, so labels would appear and vanish away from
+the thresholds the style declares.
+
+The whole layer is one `CustomPaint` — no per-tile widget churn, one
+repaint boundary. The painter applies the camera transform (translate ·
+rotate about the screen centre) itself; `MobileLayerTransformer` is not
+used.
+
+### Labels in the tile image (`LabelMode.tile`)
+
+Everything above about labels buys its quality with UI-thread time on
+every frame the map moves: every placed label laid out and drawn
+again, and a collision pass over every candidate at each placement
+interval. `LabelMode.tile` is the other trade, the one
+`vector_map_tiles` makes in its default raster mode. Labels and icons are
+placed and drawn once per display tile, into the same image as its
+geometry, and a moving map then costs what a raster tile layer costs:
+no per-frame label work. A tile that arrives while the map moves still
+has its labels laid out, shaped, placed and drawn — once, inside the
+render pump, like its geometry.
+
+It is the same pipeline with a different ending, not a second text
+stack. The raster phase records the tile's geometry in slices as in
+the default mode (`TileRasterizer.recordSlice`, stacked by `compose`)
+and, instead of taking its image, hands the composed `Picture` to the
+symbol job it enqueues (`_RenderJob.geometry`). That phase lays out and
+shapes in budgeted slices exactly as before; once shaping completes,
+`LabelPainter.paintTile` places the candidates and draws the winners
+over the nested geometry picture, and a single `toImageSync` produces
+the tile's image — one snapshot per tile, as in the default mode, and
+the picture costs no texture while it waits. Placement, drawing and
+snapshot are one unit of work, the largest a tile in this mode has,
+so when shaping finishes with the frame's budget already spent, the
+job is requeued and the unit runs in a later frame — as that pump's
+first job, or while it still has budget, never on top of a frame that
+is already full. The tile is then published
+once, image only, with an empty candidate list, so the per-frame label
+pass, the fade tracker, the retained-label pinning and the ghost labels
+all have nothing to do and are skipped. Until that publish the tile
+counts as loading, so the previous level — with its own labels in its
+images — keeps covering it; and since a tile now shows only once both
+of its phases are done, the pump drops its phase-major order (all
+rasters first, which would hold every tile back until the last raster
+had run) for a tile-major one that finishes the most central tile
+first.
+
+`paintTile` is one placing pass of the screen pass's own `_prepare`, so
+curved text and the glyph atlas, variable anchors, halos, SDF icons and
+repeat suppression all come along unchanged. What it carries over from
+one call to the next is nothing: no fades, no throttle, no incumbents,
+and a placement memory and repeat-anchor map swapped in fresh for the
+call. A tile's image is therefore a pure function of its candidates —
+which the finished-tile cache depends on — and the screen pass's state
+is never disturbed. Its collision index is bounded by the tile, and
+every box must lie inside it, `*-allow-overlap` ones included: a label
+the layouter anchored in this tile but which runs over the edge would be
+cut off there, and the neighbour that would have to draw its other half
+never sees the candidate. Such labels are dropped, which leaves gaps
+along tile seams — the same behaviour as `vector_map_tiles`. Repeat
+suppression stops at the tile edge for the same reason: two ways of
+one street meeting at a seam can each show its name, a few pixels
+apart, where the screen pass would keep one. MapLibre
+avoids it with cross-tile placement (labels placed once for the
+viewport, then assigned to the tiles they overlap); that is a possible
+follow-up, not something this mode attempts.
+
+The other limits follow from the image. Text is evaluated at the tile's
+integer style zoom and drawn at that size, then scales with the tile
+(1× up to 2× before the next level replaces it), and turns with the map
+under rotation. A symbol layer's zoom range is applied per tile zoom
+level rather than at the exact fractional zoom — `minzoom: 12.2` shows
+from 13, `maxzoom: 16.5` until 17, as geometry layers already do in
+both modes — and the `maxzoom` ramp is evaluated at that level too. The
+layouter applies the same gate in this mode (`exact`), rather than the
+screen pass's band, so a layer the tile will not draw is neither laid
+out nor shaped. Labels fade in with their tile over
+`tileFadeDuration`; `labelFadeDuration` does nothing.
+
+Being a `toImageSync` like any other tile raster, the labelled image is
+covered by the backgrounding workaround below without further work: it
+is only ever made inside the render pump, which the lifecycle gate
+parks, and the glyph-atlas pages it may add to are discarded with the
+rest on the way back in. Switching modes, or toggling `showLabels` in
+tile mode, changes what a tile image contains, so the live tiles are
+rendered again and the outgoing level's queued jobs are retired — a job
+decides at run time which kind of image to make, and would otherwise
+publish, and cache, the wrong one.
+
+## Concurrency
+
+MVT decoding, and trimming each tile to the source layers and
+properties the theme reads, run on a small isolate pool with a priority
+queue (tiles closest to the camera centre first) and
+*silent* cancellation — a cancelled job never surfaces an exception.
+`PreparedTile` keeps geometry in `Float32List`s (tile-extent units) so
+isolate transfer is cheap, and only the feature properties referenced by
+the theme are retained.
+
+Requests are coalesced per key at every level (`SingleFlight`); a
+coalesced load polls a token joined over *all* its waiters, so one
+cancelled waiter never aborts work others still await. Transient
+failures are throttled (15 s per key) and visible tiles retry a bounded
+number of times just past that throttle; a worker isolate that dies is
+replaced, and if isolates cannot be spawned at all the pool falls back
+to the event loop permanently.
+
+On web (no isolate support for this workload) the pool degrades to
+chunked event-loop execution.
+
+## Caching
+
+| layer | keyed by | bounded by |
+| --- | --- | --- |
+| memory: `PreparedTile` | data tile, per source (`provider.cacheKey`) and property keep-lists | entry count + bytes |
+| memory: raster-source `ui.Image` | data tile per raster source | entry count + bytes (handed out as ref-counted clones) |
+| memory: finished display tile (raster `ui.Image` + symbols) | display tile, per render signature (theme id, providers, dpr, sprite *content*, labels, label mode) | GPU texture bytes (`rasterCacheMaxBytes` — by default sized from the live viewport and dpr, see below; cache owns the master image, tiles hold clones); retained signatures bounded by their combined cost |
+| disk: raw tile bytes | hash of `provider.cacheKey` + z/x/y | TTL + total size sweep |
+
+All caches are plain deterministic LRU implementations — no external
+cache framework. Every `ui.Image` has exactly one owner and is disposed
+on eviction or layer dispose; disposing the layer tears down isolates,
+pending requests and its owned images (verified by tests). Each live
+display-tile model owns exactly one `ui.Image` (a clone, when it came
+from the result cache); the result cache separately owns its master
+images and is shared process-wide, so revisiting a zoom level — or
+reopening a map over the same style — swaps finished tiles back in
+without touching the pipeline. The signature identifies the sprite sheet
+by content (`SpriteAtlas.signature`, its URL when `StyleReader` loaded
+it), never by object identity: re-reading a style builds a new atlas
+every time, so an identity key would miss on every open and strand the
+previous signature's textures. Signatures are retained past their
+layer for exactly that warm-open case, so the registry releases the
+least recently used once their combined cost exceeds the budget —
+always keeping the two most recent, so two layers over different styles
+cannot evict each other.
+
+A result-cache hit hands back a finished raster and a finished symbol
+list, but not shaped text — the text caches belong to the live
+`LabelPainter`, not to the cache. The hit is served synchronously inside
+`build` (nothing awaits above it, and the grid update loads every tile
+of the arriving level in one pass), so shaping there would put a whole
+screen's paragraphs into a single frame — the very spike the pump's
+budget exists to prevent, on the path that is supposed to be the fast
+one. The hit therefore takes the imagery immediately and enqueues a
+symbol phase that owes only the shaping, which the pump slices like any
+other. Those jobs are flagged (`_RenderJob.fromCache`) so they are not
+written back into the cache they came from: a second `put` under the
+same key would mint a second master image and dispose the one the
+display tile's clone came from.
+
+That makes a hit only as cheap as the text cache is large:
+whatever was evicted since the level was last on screen is shaped
+again. So the cache is sized to hold a zoom round trip, not just one
+screen: a phone-portrait fling from z15 to z17 and back over central
+London shapes about 7,400 distinct texts with `TileOffset.none`. At the
+2500 entries it used to hold, z15's text was gone by the time the fling
+returned, and the pump re-shaped it for 4–7.5 s after the camera stopped;
+at 8000 the same fling settles in 0.3 s. The price is memory once that
+many labels have been drawn: after a run through four dense cities the
+phone held 37–49 MB more RSS with the default offset, and 117–119 MB
+more with `TileOffset.none`, whose peak rose from 384 to 491–495 MB
+(`compare/results/raw/2026-10-12-textcache-android`).
+The text caches belong to the live painter, so nothing but eviction at
+the cap frees that while the map stays open — except
+`VectorTileLayer.clearMemoryCache()`, which calls `trimCaches()` on
+every mounted layer's painter. Every text and glyph lookup stamps the
+entry with the current placement pass, and the trim keeps only what is
+stamped with it: whatever was used since the last placing pass began.
+That is every candidate on screen, collision losers included, since a
+placing pass lays them all out, plus whatever the pump has shaped since
+then. In `LabelMode.tile` every `paintTile` call counts as a pass.
+A placing pass only looks up labels within 150 px of the screen and of
+layers in zoom range, though, while the pump shaped every published
+tile's, the buffer ring's included; trimmed, that text would be shaped
+again in paint as soon as the map moved toward it. So the layer first
+runs `prewarm` over the symbols of every tile it holds — cache hits,
+which stamp them — and the trim takes only text for places the map has
+left. A tile whose shaping straddles a pass loses the part shaped before it to
+a trim, so the layer's trim also rewinds every queued symbol job's
+shaping cursor: the pump goes over the batch again within its budget,
+a cache hit for what survived and a fresh shape for what did not,
+instead of publishing the tile and leaving the label pass to shape the
+rest inside a frame. Placement passes
+rather than frames, because a frame replaying a decision lays out only
+its winners; keyed on that, the trim would drop on-screen losers, and
+the next pass would shape them again inside a frame. The evicted
+painters are disposed at once: memory pressure often comes in the
+background, where no next pass arrives to retire them. On that phone
+RSS fell 23–43 MB within 3 s of the trim, not all the way back to what
+2500 entries had held (`compare/results/raw/2026-10-20-trim-android`).
+
+In `LabelMode.tile` the cached result is the labelled image with an
+empty symbol list, so a hit owes no shaping and is complete the moment
+it is served. The label mode is part of the render signature because it
+decides whether an image has its labels in it: served across modes, a
+cached screen-mode tile would show no labels at all, and a tile-mode
+one would show every label twice. The image is the same size either
+way, so `rasterCacheMaxBytes` and its automatic sizing hold unchanged.
+
+The budget for that cache is sized from the device rather than fixed.
+One display tile costs `(256·dpr)²·4` GPU texture bytes and one phone
+screenful is 25–35 tiles, so a *single* zoom level runs to ~80 MiB on a
+large dpr-3 phone — against which the 64 MiB this used to default to
+held **0.81 of a level**. The cache could not hold even the screen it
+was looking at, so oscillating across a zoom threshold evicted the level
+it was about to return to and re-rendered everything, every crossing.
+`autoRasterCacheBytesFor` budgets 2.5 screenfuls instead (clamped to
+64–256 MiB): two levels is the minimum a round trip needs, one each side
+of the threshold, and the half is headroom for the buffer ring. Measured
+on a dpr-3 phone crossing a POI threshold about seven times a second,
+that took a crossing from ~1200 re-rasterizations and ~1200 re-layouts
+per eight seconds to **zero**, and doubling the budget again changed
+nothing — so it is the knee, not a guess.
+
+Only final, fully-sourced results are cached, so a hit can never mask a
+pending retry. Render jobs and loads carry the tile generation they were
+built for and are dropped once it moves on, so content replaced by a
+revalidation can neither be painted nor written back into the cache that
+revalidation just invalidated. Beyond the cache's budget, revisiting a
+zoom re-rasterizes from the `PreparedTile` LRU — cheap, since only the
+visible window is processed. `VectorTileLayer.clearMemoryCache()` empties
+all three memory tiers at once — the memory-pressure valve, since the
+caches are process-wide and otherwise freed only by their budgets; the
+disk cache is untouched. It also trims each open map's label text to the
+labels on screen (see above).
+
+### Surviving a backgrounding
+
+**This section describes a workaround for an engine bug, not a design
+commitment — see the end of it for when to delete the whole thing.**
+
+Being GPU-resident is what makes a finished tile cheap to keep and cheap
+to draw, and it is also the one thing about it that an operating system
+can take away. iOS revokes GPU access for a backgrounded process, and a
+`toImageSync` raster whose Metal work is rejected does not fail —
+Impeller fills the texture with solid magenta. Nothing above the
+rasterizer can tell such an image from a real tile, so it paints, and
+caches, exactly like one; process-wide caching then makes a moment's bad
+luck last the whole session.
+
+The layer therefore tracks the app lifecycle, and the state that matters
+is `inactive`, not `paused`. The scheduler keeps frames enabled through
+`inactive` — that is what draws the app-switcher snapshot on the way out
+and the first frames on the way back in — while the context is revoked
+somewhere alongside it; from `hidden` onwards no frames are produced at
+all. So on iOS the render pump refuses to run below `resumed`, parking
+its queue rather than dropping it. Everywhere else it keeps running
+through `inactive`, which there means a window that is visible but not
+focused — a desktop window behind another app, a browser window that
+lost focus, the other half of an Android split screen — and gating it
+made such a window paint its background colour for every tile it had
+not finished; from `hidden` on, the gate is shut on every platform. On
+the return the layer discards the
+finished-tile cache, the raster-source images and the pattern stamps and
+re-rasterizes its live tiles. That recovery is cheap for the same reason
+the pipeline is split the way it is: only the last stage was affected,
+and the decoded geometry it re-renders from never left the Dart heap —
+no network, no isolate, no decode. Live tiles keep their imagery until
+the replacement lands, so nothing blanks.
+
+The "has been away" mark is process-wide rather than per layer, because
+what it condemns is: a map screen rebuilt during the return is a
+brand-new layer that lived through no backgrounding of its own, and a
+per-layer flag would leave it reading suspect textures out of a cache no
+surviving observer was there to clear. A departure that only reaches
+`inactive` — a permission dialog, a control-centre swipe — gates
+rasterization on iOS but marks nothing, so the common case costs no
+re-render.
+
+Of the two halves, the recovery is the guarantee and the gate is only a
+mitigation: `toImageSync` hands back a *deferred* image, so the raster
+thread can get to it after the transition the gate was checked before.
+
+**When this can go.** The engine already has the guard this needs and
+does not apply it to the sync path. In
+`engine/src/flutter/shell/common/snapshot_controller_impeller.cc` (read
+against `flutter/flutter@master`, August 2026),
+`MakeImpellerSnapshot` — behind `Picture.toImage` — runs under
+`GetIsGpuDisabledSyncSwitch()` and parks the work via `StoreTaskForGPU`
+when the GPU is disabled, while `MakeImpellerSnapshotSync` — behind
+`Picture.toImageSync` — calls `DoMakeRasterSnapshot` directly, with no
+switch and no deferral. The engine's shipped fixes for the same symptom
+([#169378](https://github.com/flutter/flutter/pull/169378),
+[#169596](https://github.com/flutter/flutter/pull/169596), cherry-picked
+in [#170846](https://github.com/flutter/flutter/pull/170846), and the
+follow-up [#190445](https://github.com/flutter/flutter/pull/190445)) all
+harden the image *decode* path instead. The `toImageSync` variant is
+tracked upstream as
+[flutter#191255](https://github.com/flutter/flutter/issues/191255), filed
+from this investigation — every *other* "pink images" issue is closed and
+is the decode path, so finding those closed is not evidence that this is
+fixed. Once the sync path defers, drop this section along with the
+lifecycle members in `vector_tile_layer.dart` and
+`test/app_lifecycle_raster_test.dart`, and raise the package's Flutter
+constraint to the first release carrying the fix.
+
+The disk layer is skipped entirely for providers whose bytes already
+live on the device — `VectorTileProvider.cacheBytesToDisk` returns false
+for the memory provider and for local-archive providers such as the
+companion MBTiles package. Mirroring them would store every
+tile twice and leave a zero-byte sentinel for each coordinate the source
+does not cover. The opt-out covers reads as well as writes, so an entry
+written before a source became local cannot shadow it; with no cache
+behind it, `TileByteLoader` never reports bytes as stale and the
+revalidation machinery below simply never engages. Failure throttling is
+independent of the cache and stays active either way.
+
+The disk TTL is a *revalidation* deadline, not an expiry: expired
+entries — including the zero-byte "known absent" sentinels — are served
+immediately and refetched in the background (stale-while-revalidate,
+`TileByteLoader.refresh`). When the refetch delivers different bytes the
+store re-decodes them, replaces the memory entry and notifies the layer,
+which re-rasterizes the affected display tiles; the previous raster is
+kept as an underlay for the duration of the fade, so the swap
+cross-fades instead of dipping to the background.
+
+Three properties keep that deadline honest:
+
+- **Nothing serves content the check never reached.** A refresh
+  reports failure distinctly from "unchanged", so an absence recorded
+  from an expired sentinel is withdrawn when the source could not be
+  reached — otherwise one failed request would strand the tile for the
+  session, since `obtain` short-circuits on a known absence.
+- **A stale entry that cannot be decoded still gets refetched.** The
+  revalidation runs even when the served bytes fail to prepare, because
+  it is the only thing that rewrites the disk entry; without it a torn
+  write would fail identically on every retry until the size sweep.
+- **A display tile served from the finished-tile cache is checked
+  too** (`TileStore.revalidateIfStale`). It never reaches the stores,
+  so nothing else would notice its data expiring. Data tiles still held
+  in memory are skipped — loading them ran the check already — leaving
+  one disk lookup for the case where a rendered result outlived its
+  source data.
+
+A failed refetch changes nothing displayed: the stale entry stays
+servable and is only ever deleted by the size sweep. It does not
+throttle *loads* — that would make the failure worse than the staleness
+— but it does throttle further *refreshes* of that key, so browsing an
+expired area offline cannot start one request per memory-cache miss.
+
+On web the disk row is absent: the cache resolver
+(`cache_resolver_stub.dart` vs `cache_resolver_io.dart`, mirroring the
+executor's conditional import) resolves to no persistent cache, and
+`TileStore`/`StyleReader` already tolerate a null cache — tiles degrade
+to the memory LRU plus the browser's HTTP cache.
+
+## Style engine
+
+The style reader accepts real-world MapLibre/Mapbox GL styles and is
+deliberately tolerant: unknown layer types, unknown paint properties and
+unparseable expressions degrade per-layer (with a log), never failing the
+whole style. Expressions are compiled once into Dart closures; both the
+modern expression array syntax and the legacy filter syntax are
+supported. The parser proves per property whether an expression reads
+feature data — properties that depend only on the zoom (most paint
+properties are pure zoom ramps) memoize their coerced result against
+the zoom in the typed wrappers, so a tile pass or a label frame
+evaluates each once instead of per feature. It also records whether a
+layer's filter reads the zoom (`ThemeLayer.filterReadsZoom`); a filter
+that does not is resolved once per prepared tile instead of per display
+tile (see Rendering model). Parsed CSS colours are
+memoized process-wide for the same reason. Sources are resolved through TileJSON when `url` is present,
+including `{key}` substitution. Whatever a source (or its TileJSON)
+declares as `attribution` is collected into `Style.attributions`,
+deduplicated across sources; since that value is HTML by convention it
+is parsed into both flattened text and text-plus-link spans, because
+Flutter has no DOM to hand it to. Relative URLs resolve against the
+document that declared them — sprite and source URLs against the style
+URL, tile templates against the TileJSON URL when they came from one
+(ArcGIS declares `"url": "../../"` and `tile/{z}/{y}/{x}.pbf`) — and
+the `{z}`/`{x}`/`{y}` braces survive resolution un-percent-encoded.
+
+`StyleReader.language` is applied to the style document, not to the
+engine. Before `ThemeReader` compiles anything, `localizeStyle`
+(`style/label_language.dart`) rewrites each symbol layer's `text-field`
+so that the smallest subexpression holding every name reference
+(`name`, `name:*`, `name_*`) becomes
+`["coalesce", ["get", "name:<lang>"], ["get", "name_<lang>"], <original>]`,
+and folds `resolved-locale` to the language wherever it appears. The
+smallest subexpression, not the whole field and not each reference:
+wrapping the field would drop what is shown beside the name (an
+elevation, a `({ref})`), and wrapping each reference would show the
+translation twice where a style stacks `name:latin` over
+`name:nonlatin`. Inside a `concat`, only the run of arguments spanning
+the names is wrapped, for the first reason; an expression that chooses
+between branches (`case`, `match`, `step`, `coalesce`, `string`) wraps
+each branch showing a name on its own, for the same reason, and the
+whole once only when every such branch is nothing but a name. Only references whose value
+can reach the label count, so `case` conditions, `match` inputs,
+comparisons and `has` are never touched. Legacy `{token}` templates and
+zoom stop functions are first turned into the `concat` or `step` they
+evaluate as, and only when they reference a name; with no language the
+document is passed through as the same object. Because the rewrite
+precedes compilation, the parser records `name:<lang>` and
+`name_<lang>` like any other reference, so tile preparation keeps them
+unprompted, and the property keep-lists that key the decoded-tile cache
+differ per language. The finished-tile cache is keyed by the theme id,
+and its tiles hold label text (baked into the raster with
+`LabelMode.tile`), so a language makes the id `<id>|language=<lang>`.
+The style disk cache holds the document as served; the rewrite runs on
+every read.
+
+The sprite sheet is repacked once after decoding (`padSpriteSheet` in
+`style/sprite_packer.dart`): every distinct sprite rectangle is copied
+byte for byte into a new sheet with a 2 px transparent gutter, and the
+index is rewritten to the new positions. Published sheets pack icons
+edge to edge, and an icon drawn magnified or at a fractional position
+is sampled bilinearly half a texel past its rectangle, so without the
+gutter it shows a hairline of its neighbour. Two pixels rather than one
+because ordinary icons draw with mipmaps. The copy reads the sheet back
+as premultiplied RGBA and decodes it again with `decodeImageFromPixels`,
+which keeps it web-safe and off `toImageSync`; the decode runs in a
+guarded zone because that API reports failure only as an uncaught
+error, never through its callback. If the readback or decode fails, or
+the packed sheet would exceed 4096 px on either side, the original
+sheet is kept.
+
+Sources whose `url` starts with `pmtiles://` bypass TileJSON entirely:
+`PmTilesVectorTileProvider` reads the single-file archive over HTTP
+range requests. Its `open()` fetches the 127-byte header plus root
+directory in one 16 KiB request (the spec guarantees both fit there);
+each tile then maps z/x/y onto the PMTiles Hilbert tile ID and costs at
+most two more range requests — an LRU-cached leaf directory and the
+tile blob. Directory gunzip runs at fetch through a conditional import
+(`dart:io` zlib natively, the browser's `DecompressionStream` on web).
+Tile-blob gunzip is deferred on native platforms: the provider hands
+the compressed blob through (the disk cache stores that smaller form)
+and `prepareTileSync` inflates it on the worker isolate — provider
+loads run on the UI isolate, where a 0.5–3 ms inflate per tile would
+eat into the frame budget. On web, with no worker isolate, blobs are
+inflated at fetch as before. The raster store performs the same
+gzip-magic sniff before image decode for the rare compressed-raster
+archive.
+All 64-bit offsets and tile IDs are computed with multiply/add
+arithmetic (exact to 2^53) rather than bitwise ops, which dart2js
+truncates to 32 bits — the same constraint the MVT decoder observes.
+
+Local archives are the counterpart, and they are wired up in code rather
+than by a URL scheme: a device-absolute path is not something a portable
+style document can name. `StyleReader(resolveProvider:)` substitutes a
+provider for a source id instead — consulted before any URL is read, so
+it covers vector and raster sources alike, and the substituted provider
+is owned by the `Style` like any other.
+
+MBTiles specifically lives outside this package, in
+`flutter_map_vector_tiles_mbtiles`. The reason is dependency shape, not
+layering: MBTiles is SQLite through `dart:ffi`, which would cost the web
+platform tag here — and `package:sqlite3` 3.x bundles a prebuilt SQLite
+into every consumer through a build hook with no link-hook pruning, plus
+requiring Flutter 3.38. Both costs are right for a package whose users
+all want an archive reader, and wrong for one where most users never
+open one. Three pieces of this package exist to make
+that split work, and are worth treating as contract rather than
+implementation detail: `VectorTileProvider.cacheBytesToDisk`,
+`StyleReader.resolveProvider`, and the exported `SingleFlight`. Together
+they are enough to write a fully first-class provider from outside —
+which is the standard any future format adapter should be held to.
+
+## What was deliberately changed vs. vector_map_tiles
+
+* one package instead of three (`vector_map_tiles`, `vector_tile_renderer`,
+  `executor_lib`), one rendering pipeline instead of three modes — the
+  only choice left is where labels go (`LabelMode`), and both choices
+  share one text engine;
+* `stash` replaced by ~200 lines of deterministic cache code;
+* labels moved out of tile rasters into a global screen-space pass by
+  default, with the raster-mode trade (`LabelMode.tile`) as an opt-in;
+* cancellation is a state, not an exception;
+* tile substitution (parent/child retention) is part of the core grid
+  logic instead of an afterthought;
+* `Picture.toImageSync` keeps rasters on the GPU (no async readback).

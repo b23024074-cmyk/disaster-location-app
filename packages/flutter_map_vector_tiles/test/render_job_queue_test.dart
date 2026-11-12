@@ -1,0 +1,143 @@
+import 'package:flutter_map_vector_tiles/src/grid/render_job_queue.dart';
+import 'package:flutter_test/flutter_test.dart';
+
+void main() {
+  test('pop is phase-major: all rasters before any symbol job', () {
+    final dropped = <String>[];
+    final queue = RenderJobQueue<String, String>(onDrop: dropped.add);
+    queue.enqueueRaster('a', 5, 'raster-a');
+    queue.enqueueSymbols('b', 0, 'symbols-b');
+    queue.enqueueRaster('c', 1, 'raster-c');
+
+    expect(queue.pop()!.job, 'raster-c'); // lowest raster priority first
+    expect(queue.pop()!.job, 'raster-a');
+    final last = queue.pop()!;
+    expect(last.phase, RenderPhase.symbols);
+    expect(last.job, 'symbols-b');
+    expect(queue.isEmpty, isTrue);
+    expect(dropped, isEmpty);
+  });
+
+  test('tile-major pop finishes the most central tile first', () {
+    // LabelMode.tile: a tile shows only once both phases ran, so the
+    // centre tile's symbols must not wait behind every other raster.
+    final queue = RenderJobQueue<String, String>(onDrop: (_) {});
+    queue.enqueueRaster('far', 5, 'raster-far');
+    queue.enqueueRaster('centre', 0, 'raster-centre');
+    queue.enqueueRaster('near', 1, 'raster-near');
+    expect(queue.pop(tileMajor: true)!.job, 'raster-centre');
+    // What the pump does after a raster: queue the tile's symbol phase
+    // at the same priority.
+    queue.enqueueSymbols('centre', 0, 'symbols-centre');
+    final next = queue.pop(tileMajor: true)!;
+    expect(next.phase, RenderPhase.symbols);
+    expect(next.job, 'symbols-centre');
+    expect(queue.pop(tileMajor: true)!.job, 'raster-near');
+
+    // Ties go to the symbols phase: a started tile is finished first.
+    queue.enqueueSymbols('near', 1, 'symbols-near');
+    queue.enqueueRaster('other', 1, 'raster-other');
+    expect(queue.pop(tileMajor: true)!.job, 'symbols-near');
+    expect(queue.pop(tileMajor: true)!.job, 'raster-other');
+    expect(queue.pop(tileMajor: true)!.job, 'raster-far');
+    expect(queue.pop(tileMajor: true), isNull);
+  });
+
+  test('within a phase, lower priority pops first', () {
+    final queue = RenderJobQueue<String, String>(onDrop: (_) {});
+    queue.enqueueSymbols('far', 9, 's-far');
+    queue.enqueueSymbols('near', 1, 's-near');
+    queue.enqueueSymbols('mid', 4, 's-mid');
+    expect(queue.pop()!.job, 's-near');
+    expect(queue.pop()!.job, 's-mid');
+    expect(queue.pop()!.job, 's-far');
+  });
+
+  for (final tileMajor in [false, true]) {
+    test('a resumed job wins a tie (tileMajor: $tileMajor)', () {
+      // Sliced recording: tiles of equal priority must finish one after
+      // the other, not take turns a slice each.
+      final queue = RenderJobQueue<String, String>(onDrop: (_) {});
+      for (final key in ['a', 'b', 'c']) {
+        queue.enqueueRaster(key, 0, 'raster-$key');
+      }
+      final first = queue.pop(tileMajor: tileMajor)!;
+      expect(first.job, 'raster-a');
+      queue.enqueueRaster('a', 0, first.job, resumed: true);
+      expect(queue.pop(tileMajor: tileMajor)!.job, 'raster-a');
+
+      final symbols = RenderJobQueue<String, String>(onDrop: (_) {});
+      for (final key in ['x', 'y']) {
+        symbols.enqueueSymbols(key, 7, 'symbols-$key');
+      }
+      symbols.enqueueSymbols('y', 7, 'symbols-y', resumed: true);
+      expect(symbols.pop(tileMajor: tileMajor)!.job, 'symbols-y');
+      expect(symbols.pop(tileMajor: tileMajor)!.job, 'symbols-x');
+    });
+  }
+
+  test('a resumed job does not beat a more central fresh one', () {
+    final queue = RenderJobQueue<String, String>(onDrop: (_) {});
+    queue.enqueueRaster('edge', 4, 'raster-edge', resumed: true);
+    queue.enqueueRaster('centre', 0, 'raster-centre');
+    expect(queue.pop()!.job, 'raster-centre');
+    expect(queue.pop()!.job, 'raster-edge');
+  });
+
+  test('a new raster job replaces the tile\'s pending raster job', () {
+    final dropped = <String>[];
+    final queue = RenderJobQueue<String, String>(onDrop: dropped.add);
+    queue.enqueueRaster('a', 3, 'old');
+    queue.enqueueRaster('a', 3, 'new');
+    expect(dropped, ['old']);
+    expect(queue.pop()!.job, 'new');
+    expect(queue.isEmpty, isTrue);
+  });
+
+  test('an accepted raster job supersedes the tile\'s pending symbols', () {
+    final dropped = <String>[];
+    final queue = RenderJobQueue<String, String>(onDrop: dropped.add);
+    queue.enqueueSymbols('a', 3, 'stale-symbols');
+    queue.enqueueRaster('a', 3, 'raster');
+    expect(dropped, ['stale-symbols'],
+        reason: 'the raster re-enqueues its own symbol job when it runs');
+    expect(queue.pop()!.job, 'raster');
+    expect(queue.isEmpty, isTrue);
+  });
+
+  test('pendingRaster exposes the queued raster job for policy checks', () {
+    final queue = RenderJobQueue<String, String>(onDrop: (_) {});
+    expect(queue.pendingRaster('a'), isNull);
+    queue.enqueueRaster('a', 0, 'raster');
+    queue.enqueueSymbols('a', 0, 'symbols');
+    expect(queue.pendingRaster('a'), 'raster');
+  });
+
+  test('remove drops both phases, clear drops everything', () {
+    final dropped = <String>[];
+    final queue = RenderJobQueue<String, String>(onDrop: dropped.add);
+    queue.enqueueRaster('a', 0, 'raster-a');
+    // A tile can hold one job per phase at the same time.
+    queue.enqueueSymbols('b', 0, 'symbols-b');
+    queue.enqueueSymbols('a', 0, 'symbols-a');
+    expect(dropped, isEmpty);
+
+    queue.remove('a');
+    expect(dropped, unorderedEquals(['raster-a', 'symbols-a']));
+    expect(queue.length, 1);
+
+    dropped.clear();
+    queue.clear();
+    expect(dropped, ['symbols-b']);
+    expect(queue.isEmpty, isTrue);
+  });
+
+  test('symbolJobs lists the queued symbols jobs and nothing else', () {
+    final queue = RenderJobQueue<String, String>(onDrop: (_) {});
+    expect(queue.symbolJobs, isEmpty);
+    queue.enqueueRaster('a', 0, 'raster-a');
+    queue.enqueueSymbols('b', 1, 'symbols-b');
+    queue.enqueueSymbols('c', 2, 'symbols-c');
+    expect(queue.symbolJobs, unorderedEquals(['symbols-b', 'symbols-c']));
+  });
+}

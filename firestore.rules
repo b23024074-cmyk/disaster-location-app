@@ -1,0 +1,137 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function adminPath() {
+      return /databases/$(database)/documents/admins/$(request.auth.uid);
+    }
+
+    function isAdmin() {
+      return signedIn()
+        && exists(adminPath())
+        && get(adminPath()).data.enabled == true;
+    }
+
+    function accessPath() {
+      return /databases/$(database)/documents/user_access/$(request.auth.uid);
+    }
+
+    function userPath(userId) {
+      return /databases/$(database)/documents/users/$(userId);
+    }
+
+    function targetAccessPath(friendAuthUid) {
+      return /databases/$(database)/documents/user_access/$(friendAuthUid);
+    }
+
+    function hasAccessRecord() {
+      return signedIn() && exists(accessPath());
+    }
+
+    function currentAppUserId() {
+      return get(accessPath()).data.userId;
+    }
+
+    function isFriend(friendId) {
+      return hasAccessRecord()
+        && get(accessPath()).data.friendIds is list
+        && friendId in get(accessPath()).data.friendIds
+        && exists(userPath(friendId))
+        && get(userPath(friendId)).data.authUid is string
+        && exists(targetAccessPath(get(userPath(friendId)).data.authUid))
+        && get(
+          targetAccessPath(get(userPath(friendId)).data.authUid)
+        ).data.friendIds is list
+        && currentAppUserId() in get(
+          targetAccessPath(get(userPath(friendId)).data.authUid)
+        ).data.friendIds;
+    }
+
+    function isRescueSharing(userId) {
+      return exists(userPath(userId))
+        && get(userPath(userId)).data.rescueRequest == true;
+    }
+
+    function canReadLocation(userId) {
+      return isAdmin() || (signedIn() && (
+        (hasAccessRecord() && currentAppUserId() == userId)
+        || isFriend(userId)
+        || isRescueSharing(userId)
+      ));
+    }
+
+    function isOwnRelay(data) {
+      return hasAccessRecord()
+        && data.relayAuthUid == request.auth.uid
+        && data.relayedByUserId == currentAppUserId();
+    }
+
+    match /users/{userId} {
+      allow get, list: if isAdmin() || (signedIn() && (
+        (resource != null && resource.data.authUid == request.auth.uid)
+        || isFriend(userId)
+        || resource.data.rescueRequest == true
+      ));
+
+      allow create: if signedIn()
+        && request.resource.data.userId == userId
+        && request.resource.data.authUid == request.auth.uid;
+
+      allow update: if signedIn()
+        && resource.data.authUid == request.auth.uid
+        && request.resource.data.userId == userId
+        && request.resource.data.authUid == request.auth.uid;
+
+      allow delete: if false;
+    }
+
+    match /user_access/{authUid} {
+      allow get: if signedIn() && request.auth.uid == authUid;
+      allow list, delete: if false;
+
+      allow create, update: if signedIn()
+        && request.auth.uid == authUid
+        && request.resource.data.authUid == authUid
+        && request.resource.data.userId is string
+        && request.resource.data.friendIds is list
+        && request.resource.data.friendIds.size() <= 200
+        && request.resource.data.keys().hasOnly([
+          'authUid', 'userId', 'friendIds', 'updatedAt'
+        ])
+        && get(
+          /databases/$(database)/documents/users/$(request.resource.data.userId)
+        ).data.authUid == authUid;
+    }
+
+    // Admin membership is provisioned out of band; clients can only inspect their own grant.
+    match /admins/{authUid} {
+      allow get: if signedIn() && request.auth.uid == authUid;
+      allow list, create, update, delete: if false;
+    }
+
+    // QR中継情報はログイン済みユーザー間で共有し、中継を書いた本人だけ更新できます。
+    match /relay_latest/{sourceUserId} {
+      allow read: if canReadLocation(sourceUserId);
+      allow create, update: if isOwnRelay(request.resource.data)
+        && request.resource.data.sourceUserId == sourceUserId
+        && canReadLocation(sourceUserId);
+      allow delete: if isOwnRelay(resource.data)
+        && resource.data.sourceUserId == sourceUserId;
+    }
+
+    match /relay_history/{historyId} {
+      allow read: if canReadLocation(resource.data.sourceUserId);
+      allow create, update: if isOwnRelay(request.resource.data)
+        && canReadLocation(request.resource.data.sourceUserId);
+      allow delete: if isOwnRelay(resource.data);
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

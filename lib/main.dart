@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'package:connectivity_plus/connectivity_plus.dart';
 import 'dart:convert';
 
 import 'package:flutter/material.dart';
@@ -9,25 +8,53 @@ import 'package:flutter_map/flutter_map.dart';
 import 'package:latlong2/latlong.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:firebase_auth/firebase_auth.dart';
 import 'package:qr_flutter/qr_flutter.dart';
 import 'package:mobile_scanner/mobile_scanner.dart';
 import 'package:battery_plus/battery_plus.dart';
-
 import 'firebase_options.dart';
-import 'package:flutter_compass/flutter_compass.dart';
-import 'dart:math' as math;
-
+import 'account_page.dart';
+import 'admin_dashboard_page.dart';
+import 'offline_map_page.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
+
+  try {
+    await Firebase.initializeApp(
+      options: DefaultFirebaseOptions.currentPlatform,
+    ).timeout(const Duration(seconds: 10));
+
+    // Firestoreのデータを端末内に永続保存する
+    FirebaseFirestore.instance.settings = const Settings(
+      persistenceEnabled: true,
+    );
+
+    debugPrint('Firestoreのオフラインキャッシュを有効化');
+
+    // Firebase匿名認証
+    try {
+      final auth = FirebaseAuth.instance;
+
+      if (auth.currentUser == null) {
+        await auth.signInAnonymously().timeout(const Duration(seconds: 5));
+      }
+
+      debugPrint('Firebase匿名認証を確認');
+    } catch (e) {
+      debugPrint('Firebase匿名認証に失敗（オフライン機能は継続）: $e');
+    }
+  } catch (e) {
+    debugPrint('Firebase初期化またはFirestore設定に失敗: $e');
+  }
+
   runApp(const MyApp());
 }
 
 class MyApp extends StatelessWidget {
   const MyApp({super.key});
 
-@override
+  @override
   Widget build(BuildContext context) {
     return MaterialApp(
       debugShowCheckedModeBanner: false,
@@ -35,7 +62,7 @@ class MyApp extends StatelessWidget {
       theme: ThemeData(
         colorScheme: ColorScheme.fromSeed(seedColor: Colors.deepPurple),
       ),
-      home: const LoginPage(),
+      home: const MyHomePage(),
     );
   }
 }
@@ -48,6 +75,13 @@ class MyHomePage extends StatefulWidget {
 }
 
 class _MyHomePageState extends State<MyHomePage> {
+  static const String _relayLocationCacheResetKey =
+      'relay_location_cache_reset_v2';
+  static const String _friendRegistrationResetKey =
+      'friend_registration_reset_v1';
+  static const String _personalDataResetKey = 'personal_data_reset_v1';
+  static const String _displayNameOwnerKey = 'display_name_auth_uid';
+
   final displayNameController = TextEditingController(text: '');
   final friendIdController = TextEditingController();
 
@@ -61,150 +95,247 @@ class _MyHomePageState extends State<MyHomePage> {
   double? longitude;
   double? accuracy;
   int? batteryLevel;
+  DateTime? lastLocationCapturedAt;
 
   String safetyStatus = '未登録';
   bool rescueRequest = false;
 
   Timer? locationTimer;
-  StreamSubscription<List<ConnectivityResult>>? connectivitySubscription;
-  bool isNetworkConnected = false;
-  bool isUploadingLocation = false;
+  Timer? relaySyncTimer;
+  bool _updatingLocationSilently = false;
 
-  List<Map<String, dynamic>> relayedPeople = [];
+  List<Map<String, dynamic>> relayQueue = [];
+  List<Map<String, dynamic>> cachedCloudRelays = [];
+  DateTime? _relayMapCacheCutoff;
+  bool isRelaySyncing = false;
+  bool _accountMappingReady = true;
+  Map<String, dynamic>? _pendingAccountMigration;
+
+  bool get _hasRegisteredEmailAccount {
+    final user = FirebaseAuth.instance.currentUser;
+    return user != null &&
+        !user.isAnonymous &&
+        (user.email?.trim().isNotEmpty ?? false);
+  }
 
   @override
   void initState() {
     super.initState();
+    _accountMappingReady =
+        FirebaseAuth.instance.currentUser?.isAnonymous ?? true;
     initUser();
-    startConnectivityMonitoring();
 
     locationTimer = Timer.periodic(
       const Duration(seconds: 10),
       (_) => updateLocationSilently(),
+    );
+
+    relaySyncTimer = Timer.periodic(
+      const Duration(seconds: 20),
+      (_) => syncPendingRelayQueue(),
     );
   }
 
   @override
   void dispose() {
     locationTimer?.cancel();
-    connectivitySubscription?.cancel();
+    relaySyncTimer?.cancel();
     displayNameController.dispose();
     friendIdController.dispose();
     super.dispose();
   }
 
-
-  Future<void> startConnectivityMonitoring() async {
-    final initialResults = await Connectivity().checkConnectivity();
-    await handleConnectivityChanged(initialResults);
-    connectivitySubscription =
-        Connectivity().onConnectivityChanged.listen(handleConnectivityChanged);
-  }
-
-  Future<void> handleConnectivityChanged(
-    List<ConnectivityResult> results,
-  ) async {
-    final connected =
-        results.any((result) => result != ConnectivityResult.none);
-    final wasConnected = isNetworkConnected;
-    isNetworkConnected = connected;
-    if (mounted) setState(() {});
-    if (connected && !wasConnected) {
-      if (latitude != null && longitude != null) {
-        await saveDataToFirebase();
-      } else {
-        await uploadPendingLocation();
-      }
-    }
-  }
-
-  Future<void> savePendingLocationLocally() async {
-    if (latitude == null || longitude == null) return;
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setDouble('pending_latitude', latitude!);
-    await prefs.setDouble('pending_longitude', longitude!);
-    await prefs.setDouble('pending_accuracy', accuracy ?? 0);
-    await prefs.setInt('pending_battery', batteryLevel ?? -1);
-    await prefs.setBool('pending_location_upload', true);
-  }
-
-  Future<void> uploadPendingLocation() async {
-    if (!isNetworkConnected || myUserId.isEmpty || isUploadingLocation) {
-      return;
-    }
-    final prefs = await SharedPreferences.getInstance();
-    if (!(prefs.getBool('pending_location_upload') ?? false)) return;
-
-    try {
-      isUploadingLocation = true;
-      final lat = prefs.getDouble('pending_latitude');
-      final lng = prefs.getDouble('pending_longitude');
-      final acc = prefs.getDouble('pending_accuracy');
-      final bat = prefs.getInt('pending_battery');
-      if (lat == null || lng == null) return;
-
-      await FirebaseFirestore.instance.collection('users').doc(myUserId).set({
-        'userId': myUserId,
-        'displayName': displayName,
-        'friendIds': friendIds,
-        'latitude': lat,
-        'longitude': lng,
-        'accuracy': acc,
-        'batteryLevel': bat != null && bat >= 0 ? bat : null,
-        'safetyStatus': safetyStatus,
-        'rescueRequest': rescueRequest,
-        'updatedAt': FieldValue.serverTimestamp(),
-      }, SetOptions(merge: true));
-
-      await prefs.remove('pending_latitude');
-      await prefs.remove('pending_longitude');
-      await prefs.remove('pending_accuracy');
-      await prefs.remove('pending_battery');
-      await prefs.remove('pending_location_upload');
-    } catch (_) {
-      // 次回の再接続時に再試行
-    } finally {
-      isUploadingLocation = false;
-    }
-  }
-
   Future<void> initUser() async {
     final prefs = await SharedPreferences.getInstance();
 
+    // 一度だけ、端末に保存された名前・位置・QR中継データを初期化する。
+    if (prefs.getString(_personalDataResetKey) != 'done') {
+      await prefs.remove('display_name');
+      await prefs.remove('last_location_data');
+      await prefs.remove('cached_cloud_relays_json');
+      await prefs.setString('relay_queue_json', '[]');
+      await prefs.setStringList('friend_ids', []);
+      await prefs.setString(_personalDataResetKey, 'done');
+    }
+
+    if (prefs.getString(_friendRegistrationResetKey) != 'done') {
+      await prefs.setStringList('friend_ids', []);
+      await prefs.setString(_friendRegistrationResetKey, 'done');
+    }
+
+    // Reset clears relay documents server-side too; discard pre-reset local
+    // cloud cache and hide pre-reset local QR reports from the map.
+    if (prefs.getString(_relayLocationCacheResetKey) != 'done') {
+      await prefs.remove('cached_cloud_relays_json');
+      final cutoff = DateTime.now();
+      await prefs.setString('relay_map_cache_cutoff', cutoff.toIso8601String());
+      await prefs.setString(_relayLocationCacheResetKey, 'done');
+    }
+    _relayMapCacheCutoff = DateTime.tryParse(
+      prefs.getString('relay_map_cache_cutoff') ?? '',
+    );
+
+    final authUser = FirebaseAuth.instance.currentUser;
+    if (authUser != null && !authUser.isAnonymous) {
+      try {
+        final accessDoc = await FirebaseFirestore.instance
+            .collection('user_access')
+            .doc(authUser.uid)
+            .get(const GetOptions(source: Source.serverAndCache))
+            .timeout(const Duration(seconds: 8));
+        final access = accessDoc.data();
+        final mappedId = access?['userId']?.toString();
+        if (accessDoc.exists && mappedId != null && mappedId.isNotEmpty) {
+          await prefs.setString('user_id', mappedId);
+          final mappedFriends = access?['friendIds'];
+          if (mappedFriends is List) {
+            await prefs.setStringList(
+              'friend_ids',
+              mappedFriends.whereType<String>().toList(),
+            );
+          }
+        } else {
+          _accountMappingReady = false;
+        }
+      } catch (error) {
+        debugPrint('ログイン済みアカウントの紐付け確認を保留: $error');
+        _accountMappingReady = false;
+      }
+    }
+
+    // 匿名利用中に残っていた古いGPSキャッシュは読み込まず破棄する。
+    if (!_hasRegisteredEmailAccount) {
+      await prefs.remove('last_location_data');
+    }
+    final savedLocationData = _hasRegisteredEmailAccount
+        ? prefs.getString('last_location_data')
+        : null;
+
+    if (savedLocationData != null) {
+      try {
+        final decoded = jsonDecode(savedLocationData);
+
+        if (decoded is Map &&
+            decoded['latitude'] is num &&
+            decoded['longitude'] is num &&
+            decoded['accuracy'] is num &&
+            decoded['locationCapturedAt'] is String) {
+          final savedTime = DateTime.tryParse(
+            decoded['locationCapturedAt'] as String,
+          );
+
+          if (savedTime != null) {
+            latitude = (decoded['latitude'] as num).toDouble();
+            longitude = (decoded['longitude'] as num).toDouble();
+            accuracy = (decoded['accuracy'] as num).toDouble();
+            lastLocationCapturedAt = savedTime;
+          }
+        }
+      } catch (_) {
+        // 保存データが不正な場合は復元しない
+      }
+    }
+
     var savedUserId = prefs.getString('user_id');
+
     if (savedUserId == null || savedUserId.isEmpty) {
       savedUserId = 'user_${DateTime.now().microsecondsSinceEpoch}';
       await prefs.setString('user_id', savedUserId);
     }
 
-    final savedName = prefs.getString('display_name');
+    Map<String, dynamic>? savedProfile;
+    if (authUser != null && _accountMappingReady) {
+      try {
+        final profile = await FirebaseFirestore.instance
+            .collection('users')
+            .doc(savedUserId)
+            .get(const GetOptions(source: Source.serverAndCache))
+            .timeout(const Duration(seconds: 8));
+        if (profile.data()?['authUid'] == authUser.uid) {
+          savedProfile = profile.data();
+        }
+      } catch (error) {
+        debugPrint('自分のプロフィール復元を保留: $error');
+      }
+    }
+
+    String? savedName;
+    if (authUser != null && !authUser.isAnonymous) {
+      final profileName = savedProfile?['displayName']?.toString().trim();
+      if (profileName != null && profileName.isNotEmpty) {
+        savedName = profileName;
+        await prefs.setString('display_name', profileName);
+        await prefs.setString(_displayNameOwnerKey, authUser.uid);
+      } else if (savedProfile != null) {
+        await prefs.remove('display_name');
+        await prefs.remove(_displayNameOwnerKey);
+      } else if (prefs.getString(_displayNameOwnerKey) == authUser.uid) {
+        savedName = prefs.getString('display_name');
+      }
+    } else {
+      savedName =
+          prefs.getString('display_name') ??
+          savedProfile?['displayName']?.toString();
+    }
     final savedFriendIds = prefs.getStringList('friend_ids') ?? [];
+    final savedRelayQueue = loadRelayQueueFromPrefs(prefs);
+    final rawCloudRelays = prefs.getString('cached_cloud_relays_json');
+    List<Map<String, dynamic>> savedCloudRelays = [];
+
+    if (rawCloudRelays != null && rawCloudRelays.isNotEmpty) {
+      try {
+        final decoded = jsonDecode(rawCloudRelays);
+
+        if (decoded is List) {
+          savedCloudRelays = decoded
+              .whereType<Map>()
+              .map((item) => Map<String, dynamic>.from(item))
+              .toList();
+        }
+      } catch (e) {
+        debugPrint('保存済み中継情報の読み込み失敗: $e');
+      }
+    }
     final currentBatteryLevel = await getBatteryLevelSafely();
-    final savedRelayedPeople = loadRelayedPeopleFromPrefs(prefs);
-    // Firestore上にusersドキュメントを初期作成・更新する
-    await FirebaseFirestore.instance.collection('users').doc(savedUserId).set({
-      'role': 'user',
-      'shared_with': savedFriendIds,
-    }, SetOptions(merge: true));
 
     setState(() {
       myUserId = savedUserId!;
       friendIds = savedFriendIds;
+      relayQueue = savedRelayQueue;
       batteryLevel = currentBatteryLevel;
-      relayedPeople = savedRelayedPeople;
+      cachedCloudRelays = savedCloudRelays;
+      if (savedProfile != null) {
+        safetyStatus = savedProfile['safetyStatus']?.toString() ?? '未登録';
+        rescueRequest = savedProfile['rescueRequest'] == true;
+      }
 
       if (savedName != null && savedName.isNotEmpty) {
         displayNameController.text = savedName;
       }
     });
 
-    await saveDataToFirebase();
+    if (!_accountMappingReady) {
+      debugPrint('アカウント紐付け未確認のため、クラウド保存と中継送信を保留');
+      return;
+    }
+
+    debugPrint(
+      '【クラウド復元診断】保存済み=${savedCloudRelays.length}件 '
+      '復元後=${cachedCloudRelays.length}件',
+    );
+
+    try {
+      await saveDataToFirebase();
+    } catch (e) {
+      debugPrint('ユーザー情報と友達アクセス設定の初期保存に失敗: $e');
+    }
+
+    await cleanupSelfRelayData();
+    await syncPendingRelayQueue();
   }
 
-  List<Map<String, dynamic>> loadRelayedPeopleFromPrefs(
-    SharedPreferences prefs,
-  ) {
-    final raw = prefs.getString('relayed_people_json');
+  List<Map<String, dynamic>> loadRelayQueueFromPrefs(SharedPreferences prefs) {
+    final raw = prefs.getString('relay_queue_json');
     if (raw == null || raw.isEmpty) return [];
 
     try {
@@ -220,9 +351,114 @@ class _MyHomePageState extends State<MyHomePage> {
     }
   }
 
-  Future<void> saveRelayedPeopleToPrefs() async {
+  Future<void> saveRelayQueueToPrefs() async {
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setString('relayed_people_json', jsonEncode(relayedPeople));
+    await prefs.setString('relay_queue_json', jsonEncode(relayQueue));
+  }
+
+  Future<void> saveCachedCloudRelays() async {
+    final prefs = await SharedPreferences.getInstance();
+
+    await prefs.setString(
+      'cached_cloud_relays_json',
+      jsonEncode(cachedCloudRelays),
+    );
+  }
+
+  Future<void> updateCachedCloudRelays(List<QueryDocumentSnapshot> docs) async {
+    final newRelays = docs.map((doc) {
+      final data = Map<String, dynamic>.from(
+        doc.data() as Map<String, dynamic>,
+      );
+
+      // FirestoreのTimestampを保存可能な文字列に変換
+      data.updateAll((key, value) {
+        if (value is Timestamp) {
+          return value.toDate().toIso8601String();
+        }
+        return value;
+      });
+
+      data['sourceUserId'] = doc.id;
+      return data;
+    }).toList();
+
+    if (newRelays.isEmpty) {
+      if (cachedCloudRelays.isEmpty) return;
+      cachedCloudRelays = [];
+      await saveCachedCloudRelays();
+      if (mounted) setState(() {});
+      return;
+    }
+
+    // 保存済みデータと同じなら、書き込みを繰り返さない
+    if (jsonEncode(cachedCloudRelays) == jsonEncode(newRelays)) {
+      return;
+    }
+
+    cachedCloudRelays = newRelays;
+    await saveCachedCloudRelays();
+  }
+
+  Future<void> cleanupSelfRelayData() async {
+    if (myUserId.isEmpty) return;
+
+    bool queueChanged = false;
+
+    relayQueue.removeWhere((item) {
+      final sourceUserId = item['sourceUserId']?.toString();
+      final relayedByUserId = item['relayedByUserId']?.toString();
+
+      final isSelfRelay =
+          sourceUserId == myUserId && relayedByUserId == myUserId;
+
+      if (isSelfRelay) {
+        queueChanged = true;
+      }
+
+      return isSelfRelay;
+    });
+
+    if (queueChanged) {
+      if (mounted) {
+        setState(() {});
+      }
+      await saveRelayQueueToPrefs();
+    }
+
+    try {
+      final latestRef = FirebaseFirestore.instance
+          .collection('relay_latest')
+          .doc(myUserId);
+
+      final latestDoc = await latestRef.get();
+
+      if (latestDoc.exists) {
+        final latestData = latestDoc.data();
+        final sourceUserId = latestData?['sourceUserId']?.toString();
+        final relayedByUserId = latestData?['relayedByUserId']?.toString();
+
+        if (sourceUserId == myUserId && relayedByUserId == myUserId) {
+          await latestRef.delete();
+        }
+      }
+    } catch (_) {
+      // 通信できない場合は何もしない
+    }
+
+    try {
+      final historySnapshot = await FirebaseFirestore.instance
+          .collection('relay_history')
+          .where('sourceUserId', isEqualTo: myUserId)
+          .where('relayedByUserId', isEqualTo: myUserId)
+          .get();
+
+      for (final doc in historySnapshot.docs) {
+        await doc.reference.delete();
+      }
+    } catch (_) {
+      // 通信できない場合は何もしない
+    }
   }
 
   String get displayName {
@@ -247,45 +483,87 @@ class _MyHomePageState extends State<MyHomePage> {
   Future<void> saveDisplayName() async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString('display_name', displayName);
+    final authUser = FirebaseAuth.instance.currentUser;
+    if (authUser != null) {
+      await prefs.setString(_displayNameOwnerKey, authUser.uid);
+    } else {
+      await prefs.remove(_displayNameOwnerKey);
+    }
     await saveDataToFirebase();
     setState(() {});
   }
 
   Future<void> saveDataToFirebase() async {
-    if (myUserId.isEmpty) return;
+    if (myUserId.isEmpty || !_accountMappingReady) return;
 
-    final currentBatteryLevel = await getBatteryLevelSafely();
-    if (mounted) {
-      setState(() => batteryLevel = currentBatteryLevel);
-    }
+    final authUser = FirebaseAuth.instance.currentUser;
 
-    if (!isNetworkConnected) {
-      await savePendingLocationLocally();
+    if (authUser == null) {
+      debugPrint('Firebase未認証のためクラウド保存をスキップ');
       return;
     }
 
-    try {
-      await FirebaseFirestore.instance.collection('users').doc(myUserId).set({
-        'userId': myUserId,
-        'displayName': displayName,
-        'friendIds': friendIds,
-        'latitude': latitude,
-        'longitude': longitude,
-        'accuracy': accuracy,
-        'batteryLevel': currentBatteryLevel,
-        'safetyStatus': safetyStatus,
-        'rescueRequest': rescueRequest,
-        'updatedAt': FieldValue.serverTimestamp(),
-      }, SetOptions(merge: true));
-    } catch (_) {
-      await savePendingLocationLocally();
+    final currentBatteryLevel = await getBatteryLevelSafely();
+
+    if (mounted) {
+      setState(() {
+        batteryLevel = currentBatteryLevel;
+      });
     }
+
+    final canPersistLocation =
+        _hasRegisteredEmailAccount && latitude != null && longitude != null;
+    final profileData = <String, dynamic>{
+      'userId': myUserId,
+      'authUid': authUser.uid,
+      'friendIds': friendIds,
+      'updatedAt': FieldValue.serverTimestamp(),
+      'latitude': canPersistLocation ? latitude : FieldValue.delete(),
+      'longitude': canPersistLocation ? longitude : FieldValue.delete(),
+      'accuracy': canPersistLocation ? accuracy : FieldValue.delete(),
+      'locationCapturedAt': canPersistLocation
+          ? lastLocationCapturedAt?.toIso8601String()
+          : FieldValue.delete(),
+      'batteryLevel': canPersistLocation
+          ? currentBatteryLevel
+          : FieldValue.delete(),
+      'safetyStatus': safetyStatus == '譛ｪ逋ｻ骭ｲ'
+          ? FieldValue.delete()
+          : safetyStatus,
+      'rescueRequest': rescueRequest ? true : FieldValue.delete(),
+    };
+    final enteredName = displayNameController.text.trim();
+    if (enteredName.isNotEmpty) {
+      profileData['displayName'] = enteredName;
+    } else {
+      profileData['displayName'] = FieldValue.delete();
+    }
+
+    await FirebaseFirestore.instance
+        .collection('users')
+        .doc(myUserId)
+        .set(profileData, SetOptions(merge: true));
+
+    await FirebaseFirestore.instance
+        .collection('user_access')
+        .doc(authUser.uid)
+        .set({
+          'authUid': authUser.uid,
+          'userId': myUserId,
+          'friendIds': friendIds,
+          'updatedAt': FieldValue.serverTimestamp(),
+        }, SetOptions(merge: true));
   }
 
   Future<void> addFriend() async {
     final friendId = friendIdController.text.trim();
 
-    if (friendId.isEmpty) return;
+    if (friendId.isEmpty) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('友達のIDを入力してください')));
+      return;
+    }
 
     if (friendId == myUserId) {
       ScaffoldMessenger.of(
@@ -301,16 +579,40 @@ class _MyHomePageState extends State<MyHomePage> {
       return;
     }
 
-    final prefs = await SharedPreferences.getInstance();
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      if (!mounted) return;
 
-    setState(() {
-      friendIds.add(friendId);
-    });
+      setState(() => friendIds.add(friendId));
+      await prefs.setStringList('friend_ids', friendIds);
 
-    await prefs.setStringList('friend_ids', friendIds);
-    await saveDataToFirebase();
+      Object? cloudSaveError;
+      try {
+        await saveDataToFirebase();
+      } catch (e) {
+        cloudSaveError = e;
+        debugPrint('友達IDのクラウド保存に失敗: $e');
+      }
 
-    friendIdController.clear();
+      if (!mounted) return;
+      friendIdController.clear();
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            cloudSaveError == null
+                ? '友達IDを登録しました。相手もあなたのIDを登録すると位置共有が始まります。'
+                : '友達IDはこの端末に保存しましたが、Firestoreへの保存に失敗しました。'
+                      'Firebaseのアクセス権限を確認してください。',
+          ),
+        ),
+      );
+    } catch (e) {
+      debugPrint('友達IDの端末保存に失敗: $e');
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('友達IDを端末に保存できませんでした')));
+    }
   }
 
   Future<void> removeFriend(String friendId) async {
@@ -332,10 +634,43 @@ class _MyHomePageState extends State<MyHomePage> {
   }
 
   Future<void> requestRescue() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('救助要請を公開しますか？'),
+        content: const Text(
+          '救助要請中は、あなたの位置・安否・電池情報がログイン中のアプリ利用者と管理者に共有されます。救助要請を解除すると、全利用者への共有を停止します。',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: const Text('キャンセル'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: const Text('救助要請して共有'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
     setState(() {
       rescueRequest = true;
     });
-    await saveDataToFirebase();
+    try {
+      await saveDataToFirebase();
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(const SnackBar(content: Text('救助要請を共有しました')));
+      }
+    } catch (error) {
+      if (!mounted) return;
+      setState(() => rescueRequest = false);
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('救助要請を保存できませんでした: $error')));
+    }
   }
 
   Future<void> cancelRescueRequest() async {
@@ -346,90 +681,131 @@ class _MyHomePageState extends State<MyHomePage> {
   }
 
   Future<void> getCurrentLocation() async {
-    final serviceEnabled = await Geolocator.isLocationServiceEnabled();
+    try {
+      final serviceEnabled = await Geolocator.isLocationServiceEnabled();
 
-    if (!serviceEnabled) {
+      if (!serviceEnabled) {
+        if (mounted) setState(() => locationMessage = '位置情報サービスがOFFです');
+        return;
+      }
+
+      var permission = await Geolocator.checkPermission();
+      if (permission == LocationPermission.denied) {
+        permission = await Geolocator.requestPermission();
+      }
+
+      if (permission == LocationPermission.deniedForever ||
+          permission == LocationPermission.denied) {
+        if (mounted) setState(() => locationMessage = '位置情報権限が拒否されています');
+        return;
+      }
+
+      final position = await Geolocator.getCurrentPosition(
+        desiredAccuracy: LocationAccuracy.high,
+      ).timeout(const Duration(seconds: 15));
+
+      final currentBatteryLevel = await getBatteryLevelSafely();
+      if (!mounted) return;
+
       setState(() {
-        locationMessage = '位置情報サービスがOFFです';
+        latitude = position.latitude;
+        longitude = position.longitude;
+        accuracy = position.accuracy;
+        batteryLevel = currentBatteryLevel;
+        lastLocationCapturedAt = position.timestamp;
+
+        locationMessage =
+            '現在地\n'
+            '緯度: ${position.latitude}\n'
+            '経度: ${position.longitude}\n'
+            '位置精度: ±${position.accuracy.toStringAsFixed(0)}m\n'
+            '${accuracyLevelText(position.accuracy)}\n'
+            '電池残量: ${batteryText(currentBatteryLevel)}';
       });
-      return;
+
+      final prefs = await SharedPreferences.getInstance();
+      if (_hasRegisteredEmailAccount) {
+        await prefs.setString(
+          'last_location_data',
+          jsonEncode({
+            'latitude': latitude,
+            'longitude': longitude,
+            'accuracy': accuracy,
+            'locationCapturedAt': lastLocationCapturedAt?.toIso8601String(),
+          }),
+        );
+      } else {
+        // 未登録時は画面上の一時表示だけにし、端末には保存しない。
+        await prefs.remove('last_location_data');
+      }
+
+      // 未登録時はプロフィール保存時にFirestore上の位置フィールドも削除する。
+      await saveDataToFirebase();
+    } catch (e) {
+      debugPrint('現在地の取得または保存に失敗: $e');
+      if (mounted) {
+        setState(() => locationMessage = '現在地の取得または保存に失敗しました: $e');
+      }
     }
-
-    var permission = await Geolocator.checkPermission();
-
-    if (permission == LocationPermission.denied) {
-      permission = await Geolocator.requestPermission();
-    }
-
-    if (permission == LocationPermission.deniedForever ||
-        permission == LocationPermission.denied) {
-      setState(() {
-        locationMessage = '位置情報権限が拒否されています';
-      });
-      return;
-    }
-
-    final position = await Geolocator.getCurrentPosition(
-      desiredAccuracy: LocationAccuracy.high,
-    );
-
-    final currentBatteryLevel = await getBatteryLevelSafely();
-
-    setState(() {
-      latitude = position.latitude;
-      longitude = position.longitude;
-      accuracy = position.accuracy;
-      batteryLevel = currentBatteryLevel;
-
-      locationMessage =
-          '現在地\n'
-          '緯度: ${position.latitude}\n'
-          '経度: ${position.longitude}\n'
-          '位置精度: ±${position.accuracy.toStringAsFixed(0)}m\n'
-          '${accuracyLevelText(position.accuracy)}\n'
-          '電池残量: ${batteryText(currentBatteryLevel)}';
-    });
-
-    await saveDataToFirebase();
   }
 
   Future<void> updateLocationSilently() async {
-    if (myUserId.isEmpty) return;
-
-    final serviceEnabled = await Geolocator.isLocationServiceEnabled();
-    if (!serviceEnabled) return;
-
-    final permission = await Geolocator.checkPermission();
-
-    if (permission == LocationPermission.denied ||
-        permission == LocationPermission.deniedForever) {
+    if (!_hasRegisteredEmailAccount ||
+        lastLocationCapturedAt == null ||
+        myUserId.isEmpty ||
+        !_accountMappingReady ||
+        _updatingLocationSilently) {
       return;
     }
+    _updatingLocationSilently = true;
 
-    final position = await Geolocator.getCurrentPosition(
-      desiredAccuracy: LocationAccuracy.high,
-    );
+    try {
+      final serviceEnabled = await Geolocator.isLocationServiceEnabled();
+      if (!serviceEnabled) return;
 
-    final currentBatteryLevel = await getBatteryLevelSafely();
+      final permission = await Geolocator.checkPermission();
+      if (permission == LocationPermission.denied ||
+          permission == LocationPermission.deniedForever) {
+        return;
+      }
 
-    if (!mounted) return;
+      final position = await Geolocator.getCurrentPosition(
+        desiredAccuracy: LocationAccuracy.high,
+      ).timeout(const Duration(seconds: 15));
+      final currentBatteryLevel = await getBatteryLevelSafely();
+      if (!mounted) return;
 
-    setState(() {
-      latitude = position.latitude;
-      longitude = position.longitude;
-      accuracy = position.accuracy;
-      batteryLevel = currentBatteryLevel;
+      setState(() {
+        latitude = position.latitude;
+        longitude = position.longitude;
+        accuracy = position.accuracy;
+        batteryLevel = currentBatteryLevel;
+        lastLocationCapturedAt = position.timestamp;
+        locationMessage =
+            '現在地\n'
+            '緯度: ${position.latitude}\n'
+            '経度: ${position.longitude}\n'
+            '位置精度: ±${position.accuracy.toStringAsFixed(0)}m\n'
+            '${accuracyLevelText(position.accuracy)}\n'
+            '電池残量: ${batteryText(currentBatteryLevel)}';
+      });
 
-      locationMessage =
-          '現在地\n'
-          '緯度: ${position.latitude}\n'
-          '経度: ${position.longitude}\n'
-          '位置精度: ±${position.accuracy.toStringAsFixed(0)}m\n'
-          '${accuracyLevelText(position.accuracy)}\n'
-          '電池残量: ${batteryText(currentBatteryLevel)}';
-    });
-
-    await saveDataToFirebase();
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(
+        'last_location_data',
+        jsonEncode({
+          'latitude': latitude,
+          'longitude': longitude,
+          'accuracy': accuracy,
+          'locationCapturedAt': lastLocationCapturedAt?.toIso8601String(),
+        }),
+      );
+      await saveDataToFirebase();
+    } catch (e) {
+      debugPrint('バックグラウンド位置更新に失敗: $e');
+    } finally {
+      _updatingLocationSilently = false;
+    }
   }
 
   Color statusColor(String status) {
@@ -549,6 +925,84 @@ class _MyHomePageState extends State<MyHomePage> {
     }
   }
 
+  DateTime? parseIsoTime(dynamic value) {
+    if (value is! String || value.isEmpty) return null;
+
+    try {
+      return DateTime.parse(value);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  DateTime? relayInfoTime(Map<String, dynamic> data) {
+    return parseIsoTime(data['locationCapturedAt']) ??
+        parseIsoTime(data['sourceUpdatedAt']) ??
+        parseIsoTime(data['qrCreatedAt']);
+  }
+
+  bool isSameOrOlderRelayInfo(
+    Map<String, dynamic> newData,
+    Map<String, dynamic> latestData,
+  ) {
+    final newTime = relayInfoTime(newData);
+    final latestTime = relayInfoTime(latestData);
+
+    if (newTime == null || latestTime == null) {
+      return false;
+    }
+
+    return newTime.isBefore(latestTime) || newTime.isAtSameMomentAs(latestTime);
+  }
+
+  bool isNewerRelayInfo(
+    Map<String, dynamic> newData,
+    Map<String, dynamic> latestData,
+  ) {
+    final newTime = relayInfoTime(newData);
+    final latestTime = relayInfoTime(latestData);
+
+    if (newTime == null) return false;
+    if (latestTime == null) return true;
+
+    return newTime.isAfter(latestTime);
+  }
+
+  bool isNewerIsoTime(dynamic newValue, dynamic oldValue) {
+    final newTime = parseIsoTime(newValue);
+    final oldTime = parseIsoTime(oldValue);
+
+    if (newTime == null) return false;
+    if (oldTime == null) return true;
+
+    return newTime.isAfter(oldTime);
+  }
+
+  bool isSameOrOlderIsoTime(dynamic newValue, dynamic oldValue) {
+    final newTime = parseIsoTime(newValue);
+    final oldTime = parseIsoTime(oldValue);
+
+    if (newTime == null || oldTime == null) return false;
+
+    return newTime.isBefore(oldTime) || newTime.isAtSameMomentAs(oldTime);
+  }
+
+  String safeDocId(String value) {
+    return value.replaceAll(RegExp(r'[^a-zA-Z0-9_-]'), '_');
+  }
+
+  String historyDocId(Map<String, dynamic> item) {
+    final sourceUserId = safeDocId(
+      item['sourceUserId']?.toString() ?? 'unknown',
+    );
+    final readAt = safeDocId(item['readAt']?.toString() ?? 'unknown');
+    final relayedByUserId = safeDocId(
+      item['relayedByUserId']?.toString() ?? 'unknown',
+    );
+
+    return '${sourceUserId}_${readAt}_$relayedByUserId';
+  }
+
   String accuracyText(dynamic value) {
     if (value is num) {
       return '±${value.toDouble().toStringAsFixed(0)}m';
@@ -600,6 +1054,18 @@ class _MyHomePageState extends State<MyHomePage> {
     return '';
   }
 
+  String relaySyncStatusText(dynamic status) {
+    if (status == 'sent') {
+      return '送信済み';
+    }
+
+    if (status == 'rejected_old') {
+      return '共有不可：最新情報より古いデータ';
+    }
+
+    return '未送信・送信待ち';
+  }
+
   Color cardColorByConnection(String status, dynamic batteryLevelValue) {
     if (isLowBattery(batteryLevelValue)) {
       return Colors.red.shade50;
@@ -619,6 +1085,13 @@ class _MyHomePageState extends State<MyHomePage> {
     }
   }
 
+  String locationText(dynamic lat, dynamic lng) {
+    if (lat is num && lng is num) {
+      return '緯度 ${lat.toDouble().toStringAsFixed(5)}, 経度 ${lng.toDouble().toStringAsFixed(5)} 付近';
+    }
+    return '位置情報なし';
+  }
+
   Map<String, dynamic> buildMyDisasterQrPayload() {
     final now = DateTime.now().toIso8601String();
 
@@ -632,29 +1105,39 @@ class _MyHomePageState extends State<MyHomePage> {
       'longitude': longitude,
       'accuracy': accuracy,
       'batteryLevel': batteryLevel,
-      'updatedAt': now,
-      'sharedAt': now,
+      'locationCapturedAt': lastLocationCapturedAt?.toIso8601String(),
+      'sourceUpdatedAt': now,
+      'qrCreatedAt': now,
       'hopCount': 0,
     };
   }
 
   Map<String, dynamic> normalizeDirectPerson(Map<String, dynamic> data) {
+    final now = DateTime.now().toIso8601String();
+
     return {
-      'type': 'relayed_person_info',
+      'type': 'relay_queue_item',
       'sourceUserId': data['sourceUserId'] ?? '',
       'displayName': data['displayName'] ?? '名前なし',
-      'safetyStatus': data['safetyStatus'] ?? '未登録',
+      'currentStatus': '未確認',
+      'confirmedSafetyStatus': data['safetyStatus'] ?? '未登録',
       'rescueRequest': data['rescueRequest'] == true,
       'latitude': data['latitude'],
       'longitude': data['longitude'],
       'accuracy': data['accuracy'],
       'batteryLevel': data['batteryLevel'],
-      'updatedAt': data['updatedAt'],
-      'sharedAt': data['sharedAt'],
-      'receivedAt': DateTime.now().toIso8601String(),
+      'locationCapturedAt': data['locationCapturedAt'],
+      'sourceUpdatedAt': data['sourceUpdatedAt'],
+      'qrCreatedAt': data['qrCreatedAt'],
+      'readAt': now,
+      'relayedByUserId': myUserId,
+      'relayedByName': displayName,
+      'relayDeviceName': '$displayName 端末',
       'hopCount': 0,
-      'receivedFromName': '本人から直接',
-      'receivedFromUserId': data['sourceUserId'] ?? '',
+      'syncStatus': 'pending',
+      'latestSynced': false,
+      'historySynced': false,
+      'rejectReason': null,
     };
   }
 
@@ -663,30 +1146,94 @@ class _MyHomePageState extends State<MyHomePage> {
     required String relayedByName,
     required String relayedByUserId,
   }) {
+    final now = DateTime.now().toIso8601String();
     final currentHop = data['hopCount'];
     final hopCount = currentHop is num ? currentHop.toInt() : 0;
 
     return {
-      'type': 'relayed_person_info',
+      'type': 'relay_queue_item',
       'sourceUserId': data['sourceUserId'] ?? '',
       'displayName': data['displayName'] ?? '名前なし',
-      'safetyStatus': data['safetyStatus'] ?? '未登録',
+      'currentStatus': '未確認',
+      'confirmedSafetyStatus':
+          data['confirmedSafetyStatus'] ?? data['safetyStatus'] ?? '未登録',
       'rescueRequest': data['rescueRequest'] == true,
       'latitude': data['latitude'],
       'longitude': data['longitude'],
       'accuracy': data['accuracy'],
       'batteryLevel': data['batteryLevel'],
-      'updatedAt': data['updatedAt'],
-      'sharedAt': data['sharedAt'],
-      'receivedAt': DateTime.now().toIso8601String(),
+      'locationCapturedAt': data['locationCapturedAt'],
+      'sourceUpdatedAt': data['sourceUpdatedAt'],
+      'qrCreatedAt': data['qrCreatedAt'],
+      'readAt': data['readAt'] ?? now,
+      'relayedByUserId': relayedByUserId,
+      'relayedByName': relayedByName,
+      'relayDeviceName': '$relayedByName 端末',
       'hopCount': hopCount + 1,
-      'receivedFromName': relayedByName,
-      'receivedFromUserId': relayedByUserId,
+      'syncStatus': 'pending',
+      'latestSynced': false,
+      'historySynced': false,
+      'rejectReason': null,
     };
   }
 
-  Future<void> saveRelayedPerson(Map<String, dynamic> person) async {
-    final sourceUserId = person['sourceUserId'];
+  Future<bool> isOlderThanCloudLatest(Map<String, dynamic> item) async {
+    final sourceUserId = item['sourceUserId']?.toString() ?? '';
+
+    if (sourceUserId.isEmpty) {
+      return false;
+    }
+
+    try {
+      final latestDoc = await FirebaseFirestore.instance
+          .collection('relay_latest')
+          .doc(sourceUserId)
+          .get();
+
+      if (!latestDoc.exists) {
+        return false;
+      }
+
+      final latestData = latestDoc.data();
+
+      if (latestData == null) {
+        return false;
+      }
+
+      // 新旧判定は「読み取った時刻 readAt」ではなく、
+      // Aさん本人の情報が作られた時刻 sourceUpdatedAt / qrCreatedAt で判断する。
+      return isSameOrOlderRelayInfo(item, latestData);
+    } catch (_) {
+      return false;
+    }
+  }
+
+  bool isOlderThanLocalQueueLatest(Map<String, dynamic> item) {
+    final sourceUserId = item['sourceUserId']?.toString() ?? '';
+
+    if (sourceUserId.isEmpty) {
+      return false;
+    }
+
+    final samePersonItems = relayQueue.where(
+      (q) => q['sourceUserId']?.toString() == sourceUserId,
+    );
+
+    for (final existing in samePersonItems) {
+      final existingStatus = existing['syncStatus'];
+      if (existingStatus == 'rejected_old') continue;
+
+      // ローカル比較も readAt ではなく、本人情報の作成時刻で判定する。
+      if (isSameOrOlderRelayInfo(item, existing)) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  Future<void> saveRelayQueueItem(Map<String, dynamic> item) async {
+    final sourceUserId = item['sourceUserId'];
 
     if (sourceUserId == null || sourceUserId.toString().isEmpty) {
       ScaffoldMessenger.of(
@@ -695,38 +1242,228 @@ class _MyHomePageState extends State<MyHomePage> {
       return;
     }
 
+    if (sourceUserId.toString() == myUserId) {
+      if (!mounted) return;
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('自分のQRは中継データとして保存できません'),
+          backgroundColor: Colors.orange,
+          duration: Duration(seconds: 4),
+        ),
+      );
+
+      return;
+    }
+
+    final isOldByLocal = isOlderThanLocalQueueLatest(item);
+    if (isOldByLocal) {
+      if (!mounted) return;
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('このデータは端末内に保存されている最新の情報より古いため共有できません'),
+          backgroundColor: Colors.red,
+          duration: Duration(seconds: 4),
+        ),
+      );
+
+      return;
+    }
+
+    final isOldByCloud = await isOlderThanCloudLatest(item);
+    if (isOldByCloud) {
+      if (!mounted) return;
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('このデータは現在保存されている最新の情報より古いため共有できません'),
+          backgroundColor: Colors.red,
+          duration: Duration(seconds: 4),
+        ),
+      );
+
+      return;
+    }
+
     setState(() {
-      relayedPeople.removeWhere((p) => p['sourceUserId'] == sourceUserId);
-      relayedPeople.insert(0, person);
+      relayQueue.removeWhere((p) => p['sourceUserId'] == sourceUserId);
+      relayQueue.insert(0, item);
     });
 
-    await saveRelayedPeopleToPrefs();
+    await saveRelayQueueToPrefs();
 
     if (!mounted) return;
 
     ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text('${person['displayName']} の情報を保存しました')),
+      SnackBar(content: Text('${item['displayName']} の最終確認情報を保存しました')),
     );
+
+    await syncPendingRelayQueue();
+  }
+
+  Map<String, dynamic> relayCloudData(Map<String, dynamic> item) {
+    return {
+      'sourceUserId': item['sourceUserId'],
+      'displayName': item['displayName'],
+      'currentStatus': '未確認',
+      'confirmedSafetyStatus': item['confirmedSafetyStatus'],
+      'rescueRequest': item['rescueRequest'] == true,
+      'latitude': item['latitude'],
+      'longitude': item['longitude'],
+      'accuracy': item['accuracy'],
+      'batteryLevel': item['batteryLevel'],
+      'locationCapturedAt': item['locationCapturedAt'],
+      'sourceUpdatedAt': item['sourceUpdatedAt'],
+      'qrCreatedAt': item['qrCreatedAt'],
+      'readAt': item['readAt'],
+      'relayedByUserId': item['relayedByUserId'],
+      'relayAuthUid': FirebaseAuth.instance.currentUser?.uid,
+      'relayedByName': item['relayedByName'],
+      'relayDeviceName': item['relayDeviceName'],
+      'hopCount': item['hopCount'],
+      'reportNote': 'この情報は現在の状態を保証するものではありません。',
+    };
+  }
+
+  Future<void> syncPendingRelayQueue() async {
+    if (isRelaySyncing ||
+        myUserId.isEmpty ||
+        !_accountMappingReady ||
+        relayQueue.isEmpty) {
+      return;
+    }
+
+    isRelaySyncing = true;
+
+    try {
+      await _syncPendingRelayQueueInternal();
+    } finally {
+      isRelaySyncing = false;
+    }
+  }
+
+  Future<void> _syncPendingRelayQueueInternal() async {
+    bool changed = false;
+
+    for (int i = 0; i < relayQueue.length; i++) {
+      final item = relayQueue[i];
+
+      if (item['syncStatus'] == 'sent') continue;
+      if (item['syncStatus'] == 'rejected_old') continue;
+
+      final sourceUserId = item['sourceUserId']?.toString() ?? '';
+      if (sourceUserId.isEmpty) continue;
+
+      final relayedByUserId = item['relayedByUserId']?.toString() ?? '';
+      if (sourceUserId == myUserId && relayedByUserId == myUserId) {
+        relayQueue.removeAt(i);
+        i--;
+        changed = true;
+        continue;
+      }
+
+      final latestRef = FirebaseFirestore.instance
+          .collection('relay_latest')
+          .doc(sourceUserId);
+
+      final historyRef = FirebaseFirestore.instance
+          .collection('relay_history')
+          .doc(historyDocId(item));
+
+      try {
+        final data = relayCloudData(item);
+
+        final latestSnapshot = await latestRef.get(
+          const GetOptions(source: Source.server),
+        );
+
+        bool shouldUpdateLatest = true;
+        bool isOlderThanLatest = false;
+
+        if (latestSnapshot.exists) {
+          final latestData = latestSnapshot.data();
+
+          if (latestData != null) {
+            // 新旧判定は readAt ではなく、sourceUpdatedAt / qrCreatedAt で行う。
+            if (isSameOrOlderRelayInfo(item, latestData)) {
+              shouldUpdateLatest = false;
+              isOlderThanLatest = true;
+            } else if (isNewerRelayInfo(item, latestData)) {
+              shouldUpdateLatest = true;
+              isOlderThanLatest = false;
+            } else {
+              // 判定できない場合は、安全側として最新を上書きしない
+              shouldUpdateLatest = false;
+              isOlderThanLatest = true;
+            }
+          }
+        }
+
+        if (isOlderThanLatest) {
+          relayQueue[i]['syncStatus'] = 'rejected_old';
+          relayQueue[i]['rejectReason'] = 'このデータは現在保存されている最新の情報より古いため共有できません';
+          relayQueue[i]['latestSynced'] = false;
+          relayQueue[i]['historySynced'] = false;
+
+          changed = true;
+          continue;
+        }
+
+        if (shouldUpdateLatest) {
+          await latestRef.set({
+            ...data,
+            'isOlderThanLatest': false,
+            'updatedAt': FieldValue.serverTimestamp(),
+          }, SetOptions(merge: true));
+
+          await historyRef.set({
+            ...data,
+            'historyDocId': historyDocId(item),
+            'isOlderThanLatest': false,
+            'historyStatus': 'valid_history',
+            'createdAt': FieldValue.serverTimestamp(),
+          }, SetOptions(merge: true));
+
+          relayQueue[i]['syncStatus'] = 'sent';
+          relayQueue[i]['latestSynced'] = true;
+          relayQueue[i]['historySynced'] = true;
+          relayQueue[i]['rejectReason'] = null;
+
+          changed = true;
+        }
+      } catch (e) {
+        relayQueue[i]['syncStatus'] = 'pending';
+        changed = true;
+        debugPrint('中継データ送信失敗: $e');
+      }
+    }
+
+    if (changed) {
+      setState(() {});
+      await saveRelayQueueToPrefs();
+    }
   }
 
   Future<void> handleQrScannedValue(String value) async {
     try {
       final decoded = jsonDecode(value);
 
-      if (decoded is Map<String, dynamic>) {
-        final type = decoded['type'];
+      if (decoded is Map) {
+        final data = Map<String, dynamic>.from(decoded);
+        final type = data['type'];
 
         if (type == 'disaster_user_info') {
-          final person = normalizeDirectPerson(decoded);
-          await saveRelayedPerson(person);
+          final item = normalizeDirectPerson(data);
+          await saveRelayQueueItem(item);
           return;
         }
 
         if (type == 'disaster_relay_info') {
-          final relayedByName = decoded['relayedByName']?.toString() ?? '不明な人';
+          final relayedByName = data['relayedByName']?.toString() ?? '不明な人';
           final relayedByUserId =
-              decoded['relayedByUserId']?.toString() ?? 'unknown';
-          final personData = decoded['person'];
+              data['relayedByUserId']?.toString() ?? 'unknown';
+          final personData = data['person'];
 
           if (personData is! Map) {
             ScaffoldMessenger.of(
@@ -735,13 +1472,13 @@ class _MyHomePageState extends State<MyHomePage> {
             return;
           }
 
-          final person = normalizeRelayedPerson(
+          final item = normalizeRelayedPerson(
             Map<String, dynamic>.from(personData),
             relayedByName: relayedByName,
             relayedByUserId: relayedByUserId,
           );
 
-          await saveRelayedPerson(person);
+          await saveRelayQueueItem(item);
           return;
         }
       }
@@ -753,24 +1490,27 @@ class _MyHomePageState extends State<MyHomePage> {
     await addFriend();
   }
 
-  Map<String, dynamic> buildRelayPayloadForPerson(Map<String, dynamic> person) {
+  Map<String, dynamic> buildRelayPayloadForPerson(Map<String, dynamic> item) {
     return {
       'type': 'disaster_relay_info',
       'relayedByUserId': myUserId,
       'relayedByName': displayName,
       'relayedAt': DateTime.now().toIso8601String(),
       'person': {
-        'sourceUserId': person['sourceUserId'],
-        'displayName': person['displayName'],
-        'safetyStatus': person['safetyStatus'],
-        'rescueRequest': person['rescueRequest'],
-        'latitude': person['latitude'],
-        'longitude': person['longitude'],
-        'accuracy': person['accuracy'],
-        'batteryLevel': person['batteryLevel'],
-        'updatedAt': person['updatedAt'],
-        'sharedAt': person['sharedAt'],
-        'hopCount': person['hopCount'],
+        'sourceUserId': item['sourceUserId'],
+        'displayName': item['displayName'],
+        'currentStatus': '未確認',
+        'confirmedSafetyStatus': item['confirmedSafetyStatus'],
+        'rescueRequest': item['rescueRequest'],
+        'latitude': item['latitude'],
+        'longitude': item['longitude'],
+        'accuracy': item['accuracy'],
+        'batteryLevel': item['batteryLevel'],
+        'locationCapturedAt': item['locationCapturedAt'],
+        'sourceUpdatedAt': item['sourceUpdatedAt'],
+        'qrCreatedAt': item['qrCreatedAt'],
+        'readAt': item['readAt'],
+        'hopCount': item['hopCount'],
       },
     };
   }
@@ -848,11 +1588,12 @@ class _MyHomePageState extends State<MyHomePage> {
                   const SizedBox(height: 8),
                   Text('状態: $safetyStatus'),
                   Text('救助要請: ${rescueRequest ? 'あり' : 'なし'}'),
+                  Text('位置: ${locationText(latitude, longitude)}'),
                   Text('位置精度: ${accuracyText(accuracy)}'),
                   Text('電池残量: ${batteryText(batteryLevel)}'),
                   const SizedBox(height: 8),
                   const Text(
-                    'このQRを相手が読み取ると、あなたの安否・位置・電池情報を相手端末に保存できます。',
+                    'このQRを相手が読み取ると、あなたの「最終確認情報」として相手端末に保存されます。',
                     textAlign: TextAlign.center,
                     style: TextStyle(fontSize: 12),
                   ),
@@ -871,18 +1612,31 @@ class _MyHomePageState extends State<MyHomePage> {
     );
   }
 
-  void showRelayQrForPerson(Map<String, dynamic> person) {
-    final payload = buildRelayPayloadForPerson(person);
+  void showRelayQrForPerson(Map<String, dynamic> item) {
+    final syncStatus = item['syncStatus'];
+
+    if (syncStatus == 'rejected_old') {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('このデータは現在保存されている最新の情報より古いため共有できません'),
+          backgroundColor: Colors.red,
+          duration: Duration(seconds: 4),
+        ),
+      );
+      return;
+    }
+
+    final payload = buildRelayPayloadForPerson(item);
     final qrData = jsonEncode(payload);
 
-    final personName = person['displayName'] ?? '名前なし';
+    final personName = item['displayName'] ?? '名前なし';
 
     showDialog(
       context: context,
       builder: (context) {
         return AlertDialog(
           backgroundColor: Colors.white,
-          title: Text('$personName の情報を共有'),
+          title: Text('$personName の最終確認情報を共有'),
           content: SizedBox(
             width: 330,
             child: SingleChildScrollView(
@@ -902,8 +1656,7 @@ class _MyHomePageState extends State<MyHomePage> {
                   ),
                   const SizedBox(height: 8),
                   Text(
-                    'Cさんが読み取ると、$personName の情報が保存されます。\n'
-                    'Cさん側には「$displayName 経由」と表示されます。\n'
+                    '読み取った人には「$displayName 経由」と表示されます。\n'
                     'あなた自身の位置・安否・電池情報はこのQRには含まれません。',
                     textAlign: TextAlign.center,
                     style: const TextStyle(fontSize: 12),
@@ -911,6 +1664,107 @@ class _MyHomePageState extends State<MyHomePage> {
                 ],
               ),
             ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('閉じる'),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  Future<void> showRelayHistoryDialog(
+    BuildContext context,
+    String sourceUserId,
+    String displayName,
+  ) async {
+    final snapshot = await FirebaseFirestore.instance
+        .collection('relay_history')
+        .where('sourceUserId', isEqualTo: sourceUserId)
+        .get();
+
+    final docs = snapshot.docs.where((doc) {
+      final data = doc.data();
+      final historySourceUserId = data['sourceUserId']?.toString();
+      final historyRelayedByUserId = data['relayedByUserId']?.toString();
+
+      return !(historySourceUserId == myUserId &&
+          historyRelayedByUserId == myUserId);
+    }).toList();
+
+    docs.sort((a, b) {
+      final aData = a.data();
+      final bData = b.data();
+
+      final aTime = parseIsoTime(aData['readAt']);
+      final bTime = parseIsoTime(bData['readAt']);
+
+      if (aTime == null && bTime == null) return 0;
+      if (aTime == null) return 1;
+      if (bTime == null) return -1;
+
+      return bTime.compareTo(aTime);
+    });
+
+    if (!context.mounted) return;
+
+    showDialog(
+      context: context,
+      builder: (_) {
+        return AlertDialog(
+          title: Text('$displayName さんの履歴'),
+          content: SizedBox(
+            width: 420,
+            child: docs.isEmpty
+                ? const Text('履歴はありません')
+                : SingleChildScrollView(
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: docs.map((doc) {
+                        final data = doc.data();
+
+                        final confirmedStatus =
+                            data['confirmedSafetyStatus'] ?? '未登録';
+                        final rescue = data['rescueRequest'] == true;
+                        final readAt = data['readAt'];
+                        final relayedByName = data['relayedByName'] ?? '不明';
+                        final relayDeviceName =
+                            data['relayDeviceName'] ?? '不明端末';
+                        final accuracyValue = data['accuracy'];
+                        final batteryValue = data['batteryLevel'];
+                        final hopCount = data['hopCount'] is num
+                            ? (data['hopCount'] as num).toInt()
+                            : 0;
+
+                        return Card(
+                          color: rescue ? Colors.red.shade50 : Colors.white,
+                          child: ListTile(
+                            title: Text(
+                              '${dateTimeTextFromIso(readAt)} の確認情報',
+                              style: const TextStyle(
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                            subtitle: Text(
+                              '現在の状態：未確認\n'
+                              '安否：$confirmedStatus\n'
+                              '救助要請：${rescue ? 'あり' : 'なし'}\n'
+                              '電池残量：${batteryText(batteryValue)}\n'
+                              '${batteryWarningText(batteryValue)}'
+                              '位置精度：${accuracyText(accuracyValue)} / ${accuracyLevelText(accuracyValue)}\n'
+                              '確認者：$relayedByName\n'
+                              '経由：$relayDeviceName\n'
+                              'リレー回数：$hopCount回\n'
+                              '注意：この情報は現在の状態を保証するものではありません。',
+                            ),
+                          ),
+                        );
+                      }).toList(),
+                    ),
+                  ),
           ),
           actions: [
             TextButton(
@@ -937,13 +1791,372 @@ class _MyHomePageState extends State<MyHomePage> {
   }
 
   void openAllUsersMap() {
+    openOfflineMap();
+  }
+
+  Future<void> openAccountPage() async {
+    final previousUser = FirebaseAuth.instance.currentUser;
+    _pendingAccountMigration = null;
+    final changed = await Navigator.push<bool>(
+      context,
+      MaterialPageRoute(
+        builder: (_) => AccountPage(
+          beforeCurrentAccountLink: _captureAnonymousDataForMigration,
+          beforeExistingAccountSignIn: _captureAnonymousDataForMigration,
+        ),
+      ),
+    );
+    if (changed == true && mounted) {
+      final currentUser = FirebaseAuth.instance.currentUser;
+      final becameRegisteredFromAnonymous =
+          previousUser?.isAnonymous == true &&
+          currentUser != null &&
+          !currentUser.isAnonymous;
+      await restoreFirebaseAccount(
+        migrationData: becameRegisteredFromAnonymous
+            ? _pendingAccountMigration
+            : null,
+      );
+    }
+    _pendingAccountMigration = null;
+  }
+
+  Future<void> _captureAnonymousDataForMigration() async {
+    final sourceAuth = FirebaseAuth.instance.currentUser;
+    if (sourceAuth == null || !sourceAuth.isAnonymous || myUserId.isEmpty) {
+      _pendingAccountMigration = null;
+      return;
+    }
+
+    final migrated = <String, dynamic>{'sourceUserId': myUserId};
+    try {
+      final sourceDoc = await FirebaseFirestore.instance
+          .collection('users')
+          .doc(myUserId)
+          .get(const GetOptions(source: Source.serverAndCache))
+          .timeout(const Duration(seconds: 8));
+      final sourceData = sourceDoc.data();
+      if (sourceData?['authUid'] == sourceAuth.uid) {
+        for (final field in [
+          'displayName',
+          'latitude',
+          'longitude',
+          'accuracy',
+          'locationCapturedAt',
+          'batteryLevel',
+          'safetyStatus',
+          'rescueRequest',
+        ]) {
+          if (sourceData!.containsKey(field)) {
+            migrated[field] = sourceData[field];
+          }
+        }
+      }
+    } catch (error) {
+      debugPrint('移行元プロフィールの取得失敗: $error');
+    }
+
+    final enteredName = displayNameController.text.trim();
+    if (enteredName.isNotEmpty) migrated['displayName'] = enteredName;
+    if (latitude != null && longitude != null) {
+      migrated['latitude'] = latitude;
+      migrated['longitude'] = longitude;
+      if (accuracy != null) migrated['accuracy'] = accuracy;
+      if (lastLocationCapturedAt != null) {
+        migrated['locationCapturedAt'] = lastLocationCapturedAt!
+            .toIso8601String();
+      }
+    }
+    if (batteryLevel != null) migrated['batteryLevel'] = batteryLevel;
+    migrated['safetyStatus'] = safetyStatus;
+    migrated['rescueRequest'] = rescueRequest;
+    _pendingAccountMigration = migrated;
+  }
+
+  DateTime? _migrationLocationTime(dynamic value) {
+    if (value is Timestamp) return value.toDate();
+    if (value is String) return DateTime.tryParse(value);
+    return null;
+  }
+
+  Future<void> restoreFirebaseAccount({
+    Map<String, dynamic>? migrationData,
+  }) async {
+    final authUser = FirebaseAuth.instance.currentUser;
+    if (authUser == null) return;
+    _accountMappingReady = false;
+
+    try {
+      final accessRef = FirebaseFirestore.instance
+          .collection('user_access')
+          .doc(authUser.uid);
+      final accessDoc = await accessRef
+          .get(const GetOptions(source: Source.server))
+          .timeout(const Duration(seconds: 8));
+      final access = accessDoc.data();
+      var mappedUserId = access?['userId']?.toString();
+      final hasMappedProfile = mappedUserId != null && mappedUserId.isNotEmpty;
+      if (!hasMappedProfile) {
+        mappedUserId = 'user_${DateTime.now().microsecondsSinceEpoch}';
+      }
+
+      final userRef = FirebaseFirestore.instance
+          .collection('users')
+          .doc(mappedUserId);
+      final userDoc = hasMappedProfile
+          ? await userRef
+                .get(const GetOptions(source: Source.server))
+                .timeout(const Duration(seconds: 8))
+          : null;
+      final existingData = userDoc?.data();
+      if (existingData != null && existingData['authUid'] != authUser.uid) {
+        throw StateError('移行先ユーザー情報の所有者を確認できません。');
+      }
+
+      final mappedFriends = access?['friendIds'] is List
+          ? (access!['friendIds'] as List).whereType<String>().toList()
+          : <String>[];
+      final merged = <String, dynamic>{
+        'userId': mappedUserId,
+        'authUid': authUser.uid,
+        'friendIds': mappedFriends,
+        'updatedAt': FieldValue.serverTimestamp(),
+      };
+
+      final targetName = existingData?['displayName']?.toString().trim() ?? '';
+      final sourceName = migrationData?['displayName']?.toString().trim() ?? '';
+      merged['displayName'] = targetName.isNotEmpty
+          ? targetName
+          : sourceName.isNotEmpty
+          ? sourceName
+          : FieldValue.delete();
+
+      final targetLat = existingData?['latitude'];
+      final targetLng = existingData?['longitude'];
+      final sourceLat = migrationData?['latitude'];
+      final sourceLng = migrationData?['longitude'];
+      final targetHasLocation = targetLat is num && targetLng is num;
+      final sourceHasLocation = sourceLat is num && sourceLng is num;
+      final targetTime = _migrationLocationTime(
+        existingData?['locationCapturedAt'],
+      );
+      final sourceTime = _migrationLocationTime(
+        migrationData?['locationCapturedAt'],
+      );
+      final useSourceLocation =
+          sourceHasLocation &&
+          (!targetHasLocation ||
+              (sourceTime != null &&
+                  (targetTime == null || sourceTime.isAfter(targetTime))));
+      final chosenData = useSourceLocation ? migrationData : existingData;
+      final hasLocation = useSourceLocation || targetHasLocation;
+      merged['latitude'] = hasLocation
+          ? chosenData!['latitude']
+          : FieldValue.delete();
+      merged['longitude'] = hasLocation
+          ? chosenData!['longitude']
+          : FieldValue.delete();
+      merged['accuracy'] = hasLocation && chosenData!.containsKey('accuracy')
+          ? chosenData['accuracy']
+          : FieldValue.delete();
+      merged['locationCapturedAt'] =
+          hasLocation && chosenData!.containsKey('locationCapturedAt')
+          ? chosenData['locationCapturedAt']
+          : FieldValue.delete();
+
+      final targetBattery = existingData?['batteryLevel'];
+      final sourceBattery = migrationData?['batteryLevel'];
+      merged['batteryLevel'] = targetBattery is num
+          ? targetBattery
+          : sourceBattery is num
+          ? sourceBattery
+          : FieldValue.delete();
+      merged['safetyStatus'] = existingData?.containsKey('safetyStatus') == true
+          ? existingData!['safetyStatus']
+          : migrationData?['safetyStatus'] ?? FieldValue.delete();
+      merged['rescueRequest'] =
+          existingData?['rescueRequest'] == true ||
+              migrationData?['rescueRequest'] == true
+          ? true
+          : FieldValue.delete();
+
+      await userRef.set(merged, SetOptions(merge: true));
+      await accessRef.set({
+        'authUid': authUser.uid,
+        'userId': mappedUserId,
+        'friendIds': mappedFriends,
+        'updatedAt': FieldValue.serverTimestamp(),
+      }, SetOptions(merge: true));
+
+      final finalDoc = await userRef
+          .get(const GetOptions(source: Source.server))
+          .timeout(const Duration(seconds: 8));
+      final data = finalDoc.data();
+      if (data == null || data['authUid'] != authUser.uid) {
+        throw StateError('移行後のユーザー情報を確認できませんでした。');
+      }
+
+      final prefs = await SharedPreferences.getInstance();
+      if (myUserId.isNotEmpty && myUserId != mappedUserId) {
+        relayQueue = [];
+        cachedCloudRelays = [];
+        await prefs.setString('relay_queue_json', '[]');
+        await prefs.remove('cached_cloud_relays_json');
+      }
+      await prefs.setString('user_id', mappedUserId);
+      await prefs.setStringList('friend_ids', mappedFriends);
+      final name = data['displayName']?.toString() ?? '';
+      if (name.isNotEmpty) {
+        await prefs.setString('display_name', name);
+        await prefs.setString(_displayNameOwnerKey, authUser.uid);
+      } else {
+        await prefs.remove('display_name');
+        await prefs.remove(_displayNameOwnerKey);
+      }
+      final locationTime = _migrationLocationTime(data['locationCapturedAt']);
+      if (data['latitude'] is num && data['longitude'] is num) {
+        await prefs.setString(
+          'last_location_data',
+          jsonEncode({
+            'latitude': data['latitude'],
+            'longitude': data['longitude'],
+            'accuracy': data['accuracy'],
+            'locationCapturedAt': locationTime?.toIso8601String(),
+          }),
+        );
+      } else {
+        await prefs.remove('last_location_data');
+      }
+
+      if (!mounted) return;
+      _accountMappingReady = true;
+      setState(() {
+        myUserId = mappedUserId!;
+        friendIds = mappedFriends;
+        displayNameController.text = name;
+        safetyStatus = data['safetyStatus']?.toString() ?? '譛ｪ逋ｻ骭ｲ';
+        rescueRequest = data['rescueRequest'] == true;
+        latitude = data['latitude'] is num
+            ? (data['latitude'] as num).toDouble()
+            : null;
+        longitude = data['longitude'] is num
+            ? (data['longitude'] as num).toDouble()
+            : null;
+        accuracy = data['accuracy'] is num
+            ? (data['accuracy'] as num).toDouble()
+            : null;
+        lastLocationCapturedAt = locationTime;
+        batteryLevel = data['batteryLevel'] is num
+            ? (data['batteryLevel'] as num).toInt()
+            : null;
+      });
+
+      await saveDataToFirebase();
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              migrationData == null
+                  ? 'アカウント情報を読み込みました。'
+                  : '名前・位置・安否情報を既存アカウントへ引き継ぎました。',
+            ),
+          ),
+        );
+      }
+    } catch (error) {
+      _accountMappingReady = false;
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('データを引き継げませんでした: $error')));
+      }
+    }
+  }
+
+  List<Map<String, dynamic>> mergedRelayItems() {
+    final byUserId = <String, Map<String, dynamic>>{};
+
+    final visibleQueuedRelays = relayQueue.where((item) {
+      final rawReadAt = item['readAt'];
+      final readAt = rawReadAt is Timestamp
+          ? rawReadAt.toDate()
+          : rawReadAt is String
+          ? DateTime.tryParse(rawReadAt)
+          : null;
+      final cutoff = _relayMapCacheCutoff;
+      return readAt != null && (cutoff == null || readAt.isAfter(cutoff));
+    });
+
+    final visibleCachedRelays = cachedCloudRelays.where((item) {
+      final sourceUserId = item['sourceUserId']?.toString() ?? '';
+      return friendIds.contains(sourceUserId);
+    });
+
+    for (final item in [...visibleQueuedRelays, ...visibleCachedRelays]) {
+      final userId = item['sourceUserId']?.toString() ?? '';
+
+      if (userId.isEmpty) continue;
+
+      final existing = byUserId[userId];
+
+      if (existing == null) {
+        byUserId[userId] = item;
+        continue;
+      }
+
+      final newTime = relayInfoTime(item);
+      final oldTime = relayInfoTime(existing);
+
+      if (newTime != null && (oldTime == null || newTime.isAfter(oldTime))) {
+        byUserId[userId] = item;
+      }
+    }
+
+    return byUserId.values
+        .map((item) => Map<String, dynamic>.from(item))
+        .toList();
+  }
+
+  Future<void> openOfflineMap({Map<String, dynamic>? focusUser}) async {
+    var emergencyUsers = <Map<String, dynamic>>[];
+    try {
+      final snapshot = await FirebaseFirestore.instance
+          .collection('users')
+          .where('rescueRequest', isEqualTo: true)
+          .get(const GetOptions(source: Source.serverAndCache));
+      emergencyUsers = snapshot.docs
+          .map((doc) => <String, dynamic>{'userId': doc.id, ...doc.data()})
+          .toList();
+    } catch (error) {
+      debugPrint('公開中の救助要請を取得できません: $error');
+    }
+    if (!mounted) return;
     Navigator.push(
       context,
       MaterialPageRoute(
-        builder: (_) =>
-            AllUsersMapPage(myUserId: myUserId, friendIds: friendIds),
+        builder: (_) => OfflineMapPage(
+          myUserId: myUserId,
+          friendIds: List<String>.from(friendIds),
+          relayItems: mergedRelayItems(),
+          emergencyUsers: emergencyUsers,
+          focusUser: focusUser,
+          initialCenter: _locationFromUser(focusUser),
+        ),
       ),
     );
+  }
+
+  LatLng? _locationFromUser(Map<String, dynamic>? user) {
+    final latitude = user?['latitude'];
+    final longitude = user?['longitude'];
+    if (latitude is! num || longitude is! num) return null;
+    if (latitude < -90 ||
+        latitude > 90 ||
+        longitude < -180 ||
+        longitude > 180) {
+      return null;
+    }
+    return LatLng(latitude.toDouble(), longitude.toDouble());
   }
 
   Widget buildFriendTile(String friendId) {
@@ -953,11 +2166,17 @@ class _MyHomePageState extends State<MyHomePage> {
           .doc(friendId)
           .snapshots(),
       builder: (context, snapshot) {
-        if (!snapshot.hasData) {
-          return const Card(child: ListTile(title: Text('友達本人の情報を読み込み中...')));
+        if (snapshot.hasError) {
+          return const Card(
+            child: ListTile(
+              leading: Icon(Icons.info_outline),
+              title: Text('友達情報を取得できません'),
+              subtitle: Text('通信状態またはアクセス権限を確認してください'),
+            ),
+          );
         }
 
-        if (!snapshot.data!.exists) {
+        if (!snapshot.hasData) {
           return Card(
             child: ListTile(
               title: Text(friendId),
@@ -1031,62 +2250,100 @@ class _MyHomePageState extends State<MyHomePage> {
     );
   }
 
-  Widget buildRelayedPersonTile(Map<String, dynamic> person) {
-    final name = person['displayName'] ?? '名前なし';
-    final status = person['safetyStatus'] ?? '未登録';
-    final rescue = person['rescueRequest'] == true;
-    final sourceUserId = person['sourceUserId'] ?? '';
-    final hopCount = person['hopCount'] is num
-        ? (person['hopCount'] as num).toInt()
+  Widget buildRelayQueueItemTile(Map<String, dynamic> item) {
+    final name = item['displayName'] ?? '名前なし';
+    final confirmedStatus = item['confirmedSafetyStatus'] ?? '未登録';
+    final rescue = item['rescueRequest'] == true;
+    final sourceUserId = item['sourceUserId'] ?? '';
+    final readAt = item['readAt'];
+    final hopCount = item['hopCount'] is num
+        ? (item['hopCount'] as num).toInt()
         : 0;
-    final receivedFromName = person['receivedFromName'] ?? '不明';
-    final updatedAt = person['updatedAt'];
-    final receivedAt = person['receivedAt'];
-    final personAccuracy = person['accuracy'];
-    final personBattery = person['batteryLevel'];
+    final relayedByName = item['relayedByName'] ?? displayName;
+    final relayDeviceName = item['relayDeviceName'] ?? '$displayName 端末';
+    final syncStatus = item['syncStatus'] ?? 'pending';
+    final rejectReason = item['rejectReason'];
+    final itemAccuracy = item['accuracy'];
+    final itemBattery = item['batteryLevel'];
+    final lat = item['latitude'];
+    final lng = item['longitude'];
 
     return Card(
-      color: rescue ? Colors.red.shade50 : Colors.blueGrey.shade50,
+      color: syncStatus == 'sent'
+          ? Colors.green.shade50
+          : syncStatus == 'rejected_old'
+          ? Colors.grey.shade300
+          : Colors.orange.shade50,
       child: Padding(
         padding: const EdgeInsets.only(bottom: 8),
         child: Column(
           children: [
             ListTile(
               leading: Icon(
-                rescue ? Icons.warning : Icons.qr_code_2,
-                color: rescue ? Colors.red : Colors.blueGrey,
+                syncStatus == 'rejected_old'
+                    ? Icons.block
+                    : rescue
+                    ? Icons.warning
+                    : Icons.move_to_inbox,
+                color: syncStatus == 'rejected_old'
+                    ? Colors.black54
+                    : rescue
+                    ? Colors.red
+                    : Colors.orange,
               ),
               title: Text(
-                name,
+                '$name さんの最終確認情報',
                 style: TextStyle(
                   fontWeight: FontWeight.bold,
-                  color: rescue ? Colors.red : null,
+                  color: syncStatus == 'rejected_old'
+                      ? Colors.black54
+                      : rescue
+                      ? Colors.red
+                      : null,
                 ),
               ),
               subtitle: Text(
-                '状態: $status\n'
-                '救助要請: ${rescue ? 'あり' : 'なし'}\n'
-                '電池残量: ${batteryText(personBattery)}\n'
-                '${batteryWarningText(personBattery)}'
-                '位置精度: ${accuracyText(personAccuracy)}\n'
-                '${accuracyLevelText(personAccuracy)}\n'
-                '本人更新: ${dateTimeTextFromIso(updatedAt)}（${elapsedTextFromIso(updatedAt)}）\n'
-                '読み取り: ${dateTimeTextFromIso(receivedAt)}（${elapsedTextFromIso(receivedAt)}）\n'
-                '取得経路: ${hopCount == 0 ? '本人から直接' : '$receivedFromName 経由'}\n'
-                'リレー回数: $hopCount回\n'
-                'ID: $sourceUserId\n'
-                '※本人から直接取得した最新情報とは限りません',
+                '現在の状態：未確認\n'
+                '━━━━━━━━━━━━\n'
+                '最後に確認された情報\n'
+                '安否：$confirmedStatus\n'
+                '救助要請：${rescue ? 'あり' : 'なし'}\n'
+                '位置：${locationText(lat, lng)}\n'
+                '位置精度：${accuracyText(itemAccuracy)} / ${accuracyLevelText(itemAccuracy)}\n'
+                '電池残量：${batteryText(itemBattery)}\n'
+                '${batteryWarningText(itemBattery)}'
+                'QR作成時刻：${dateTimeTextFromIso(item['sourceUpdatedAt'])}\n'
+                '確認者：$relayedByName\n'
+                '情報元：$name さんのQR\n'
+                '確認時刻：${dateTimeTextFromIso(readAt)}（${elapsedTextFromIso(readAt)}）\n'
+                '経由：$relayDeviceName\n'
+                'リレー回数：$hopCount回\n'
+                '送信状態：${relaySyncStatusText(syncStatus)}\n'
+                '${syncStatus == 'rejected_old' ? '⚠ ${rejectReason ?? 'このデータは現在保存されている最新の情報より古いため共有できません'}\n' : ''}'
+                'ID：$sourceUserId\n'
+                '━━━━━━━━━━━━\n'
+                '注意：この情報は現在の状態を保証するものではありません。',
               ),
             ),
             Padding(
               padding: const EdgeInsets.symmetric(horizontal: 16),
-              child: SizedBox(
-                width: double.infinity,
-                child: ElevatedButton.icon(
-                  onPressed: () => showRelayQrForPerson(person),
-                  icon: const Icon(Icons.share),
-                  label: Text('$name の情報だけを共有QRにする'),
-                ),
+              child: Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                children: [
+                  ElevatedButton.icon(
+                    onPressed: syncStatus == 'rejected_old'
+                        ? null
+                        : () => showRelayQrForPerson(item),
+                    icon: const Icon(Icons.qr_code),
+                    label: Text('$name さん情報をQRで渡す'),
+                  ),
+                  ElevatedButton.icon(
+                    onPressed: syncPendingRelayQueue,
+                    icon: const Icon(Icons.sync),
+                    label: const Text('未送信を同期'),
+                  ),
+                ],
               ),
             ),
           ],
@@ -1225,6 +2482,366 @@ class _MyHomePageState extends State<MyHomePage> {
     );
   }
 
+  Widget offlineRelayCard() {
+    final pendingCount = relayQueue
+        .where((item) => item['syncStatus'] == 'pending')
+        .length;
+
+    final rejectedCount = relayQueue
+        .where((item) => item['syncStatus'] == 'rejected_old')
+        .length;
+
+    final hasIssue = pendingCount > 0 || rejectedCount > 0;
+
+    return Card(
+      color: hasIssue ? Colors.orange.shade50 : Colors.grey.shade100,
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          children: [
+            Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Icon(
+                  hasIssue ? Icons.outbox : Icons.check_circle_outline,
+                  color: hasIssue ? Colors.orange : Colors.green,
+                ),
+                const SizedBox(width: 8),
+                Text(
+                  hasIssue ? '未送信の中継データがあります' : '未送信の中継データ：0件',
+                  style: TextStyle(
+                    fontSize: 18,
+                    fontWeight: FontWeight.bold,
+                    color: hasIssue ? Colors.orange.shade900 : Colors.green,
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            Text(
+              '未送信：$pendingCount 件 / 共有不可：$rejectedCount 件',
+              style: TextStyle(
+                fontWeight: FontWeight.bold,
+                color: hasIssue ? Colors.red : Colors.green,
+              ),
+            ),
+
+            if (hasIssue) ...[
+              const SizedBox(height: 8),
+              const Text(
+                '通信できるようになったら未送信データを送信します。共有不可データは最新情報より古いため送信されません。',
+                textAlign: TextAlign.center,
+                style: TextStyle(fontSize: 12),
+              ),
+            ],
+            const SizedBox(height: 12),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              alignment: WrapAlignment.center,
+              children: [
+                ElevatedButton.icon(
+                  onPressed: showMyDisasterInfoQr,
+                  icon: const Icon(Icons.qr_code),
+                  label: const Text('自分の災害情報QR'),
+                ),
+                ElevatedButton.icon(
+                  onPressed: openQrScanner,
+                  icon: const Icon(Icons.qr_code_scanner),
+                  label: const Text('災害QRを読み取る'),
+                ),
+                if (hasIssue)
+                  ElevatedButton.icon(
+                    onPressed: syncPendingRelayQueue,
+                    icon: const Icon(Icons.sync),
+                    label: const Text('未送信を同期'),
+                  ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget relayQueueCard() {
+    final visibleQueue = relayQueue
+        .where((item) => item['syncStatus'] != 'sent')
+        .toList();
+
+    if (visibleQueue.isEmpty) {
+      return const SizedBox.shrink();
+    }
+
+    return Card(
+      color: Colors.orange.shade50,
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          children: [
+            const Text(
+              '端末内の未送信・共有不可データ',
+              style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold),
+            ),
+            const SizedBox(height: 8),
+            const Text(
+              'ここは送信前の一時保管エリアです。通常は「中継で届いた最新の最終確認情報」を見てください。',
+              textAlign: TextAlign.center,
+            ),
+            const SizedBox(height: 10),
+            Column(
+              children: visibleQueue
+                  .map((item) => buildRelayQueueItemTile(item))
+                  .toList(),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget cloudRelayLatestCard() {
+    final visibleFriendIds = friendIds
+        .where((id) => id.isNotEmpty)
+        .toSet()
+        .take(30)
+        .toList();
+    return Card(
+      color: Colors.yellow.shade50,
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          children: [
+            const Text(
+              '中継で届いた最新の最終確認情報',
+              style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold),
+            ),
+            const SizedBox(height: 8),
+            const Text(
+              '相互登録済みの友達から届いた情報を表示します。古いQRで上書きされることはありません。友達が30人を超える場合、この一覧は先頭30人が対象です。',
+              textAlign: TextAlign.center,
+            ),
+            const SizedBox(height: 10),
+            if (visibleFriendIds.isEmpty)
+              const Text('相互登録済みの友達からの中継情報はありません')
+            else
+              StreamBuilder<QuerySnapshot>(
+                stream: FirebaseFirestore.instance
+                    .collection('relay_latest')
+                    .where('sourceUserId', whereIn: visibleFriendIds)
+                    .snapshots(),
+
+                builder: (context, snapshot) {
+                  if (snapshot.hasError) {
+                    return const Padding(
+                      padding: EdgeInsets.all(12),
+                      child: Text(
+                        'QR中継情報を取得できません。\n'
+                        '通信状態を確認し、友達同士で互いのIDを登録済みか確認してください。',
+                      ),
+                    );
+                  }
+
+                  if (!snapshot.hasData) {
+                    return const Padding(
+                      padding: EdgeInsets.all(12),
+                      child: CircularProgressIndicator(),
+                    );
+                  }
+
+                  final docs = snapshot.data!.docs.where((doc) {
+                    final data = doc.data() as Map<String, dynamic>;
+                    final sourceUserId = data['sourceUserId']?.toString();
+                    final relayedByUserId = data['relayedByUserId']?.toString();
+
+                    return !(sourceUserId == myUserId &&
+                        relayedByUserId == myUserId);
+                  }).toList();
+
+                  docs.sort((a, b) {
+                    final aData = a.data() as Map<String, dynamic>;
+                    final bData = b.data() as Map<String, dynamic>;
+
+                    // 最新一覧の並び順も、読み取った時刻ではなく本人情報の作成時刻で判断する
+                    final aTime = relayInfoTime(aData);
+                    final bTime = relayInfoTime(bData);
+
+                    if (aTime == null && bTime == null) return 0;
+                    if (aTime == null) return 1;
+                    if (bTime == null) return -1;
+
+                    return bTime.compareTo(aTime);
+                  });
+
+                  if (!snapshot.data!.metadata.hasPendingWrites &&
+                      !snapshot.data!.metadata.isFromCache) {
+                    WidgetsBinding.instance.addPostFrameCallback((_) {
+                      if (mounted) {
+                        updateCachedCloudRelays(docs);
+                      }
+                    });
+                  }
+
+                  if (docs.isEmpty) {
+                    return const Text('まだ中継情報は届いていません');
+                  }
+
+                  return Column(
+                    children: docs.map((doc) {
+                      final data = doc.data() as Map<String, dynamic>;
+
+                      final sourceUserId = data['sourceUserId'] ?? doc.id;
+                      final name = data['displayName'] ?? '名前なし';
+                      final confirmedStatus =
+                          data['confirmedSafetyStatus'] ?? '未登録';
+                      final rescue = data['rescueRequest'] == true;
+                      final lat = data['latitude'];
+                      final lng = data['longitude'];
+                      final sourceUpdatedAt = data['sourceUpdatedAt'];
+                      final readAt = data['readAt'];
+                      final relayedByName = data['relayedByName'] ?? '不明';
+                      final relayDeviceName = data['relayDeviceName'] ?? '不明端末';
+                      final accuracyValue = data['accuracy'];
+                      final batteryValue = data['batteryLevel'];
+                      final hopCount = data['hopCount'] is num
+                          ? (data['hopCount'] as num).toInt()
+                          : 0;
+
+                      return Card(
+                        color: rescue ? Colors.red.shade50 : Colors.white,
+                        child: Padding(
+                          padding: const EdgeInsets.only(bottom: 8),
+                          child: Column(
+                            children: [
+                              ListTile(
+                                leading: Icon(
+                                  rescue ? Icons.warning : Icons.fact_check,
+                                  color: rescue ? Colors.red : Colors.blueGrey,
+                                ),
+                                title: Text(
+                                  '$name さんの最新確認情報',
+                                  style: TextStyle(
+                                    fontWeight: FontWeight.bold,
+                                    color: rescue ? Colors.red : Colors.black,
+                                  ),
+                                ),
+                                subtitle: Text(
+                                  '現在の状態：未確認\n'
+                                  '━━━━━━━━━━━━\n'
+                                  '最後に確認された情報\n'
+                                  '安否：$confirmedStatus\n'
+                                  '救助要請：${rescue ? 'あり' : 'なし'}\n'
+                                  '位置：${locationText(lat, lng)}\n'
+                                  '位置精度：${accuracyText(accuracyValue)} / ${accuracyLevelText(accuracyValue)}\n'
+                                  '電池残量：${batteryText(batteryValue)}\n'
+                                  '${batteryWarningText(batteryValue)}'
+                                  '本人情報の作成：${dateTimeTextFromIso(sourceUpdatedAt)}\n'
+                                  '確認者：$relayedByName\n'
+                                  '情報元：$name さんのQR\n'
+                                  '確認時刻：${dateTimeTextFromIso(readAt)}（${elapsedTextFromIso(readAt)}）\n'
+                                  '経由：$relayDeviceName\n'
+                                  'リレー回数：$hopCount回\n'
+                                  '━━━━━━━━━━━━\n'
+                                  '注意：この情報は現在の状態を保証するものではありません。',
+                                ),
+                              ),
+                              Padding(
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 16,
+                                ),
+                                child: SizedBox(
+                                  width: double.infinity,
+                                  child: OutlinedButton.icon(
+                                    onPressed: () => showRelayHistoryDialog(
+                                      context,
+                                      sourceUserId.toString(),
+                                      name.toString(),
+                                    ),
+                                    icon: const Icon(Icons.history),
+                                    label: const Text('履歴を見る'),
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      );
+                    }).toList(),
+                  );
+                },
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget emergencyRequestsCard() {
+    return Card(
+      color: Colors.red.shade50,
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          children: [
+            const Text(
+              '公開中の救助要請',
+              style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold),
+            ),
+            const SizedBox(height: 6),
+            const Text(
+              '本人が救助要請を有効にしている間、ログイン中の利用者に表示されます。',
+              textAlign: TextAlign.center,
+            ),
+            const SizedBox(height: 8),
+            StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+              stream: FirebaseFirestore.instance
+                  .collection('users')
+                  .where('rescueRequest', isEqualTo: true)
+                  .snapshots(),
+              builder: (context, snapshot) {
+                if (snapshot.hasError) {
+                  return const Text('救助要請を取得できません。通信状態を確認してください。');
+                }
+                if (!snapshot.hasData) {
+                  return const CircularProgressIndicator();
+                }
+                final docs = snapshot.data!.docs;
+                if (docs.isEmpty) return const Text('現在、公開中の救助要請はありません。');
+                return Column(
+                  children: docs.map((doc) {
+                    final data = doc.data();
+                    final lat = data['latitude'];
+                    final lng = data['longitude'];
+                    final location = lat is num && lng is num
+                        ? '${lat.toStringAsFixed(5)}, ${lng.toStringAsFixed(5)}'
+                        : '位置情報なし';
+                    final battery = data['batteryLevel'];
+                    return ListTile(
+                      leading: const Icon(Icons.warning, color: Colors.red),
+                      title: Text(data['displayName']?.toString() ?? '名前なし'),
+                      subtitle: Text(
+                        '安否: ${data['safetyStatus'] ?? '未登録'} / '
+                        '位置: $location / '
+                        '電池: ${battery is num ? '${battery.toInt()}%' : '不明'}\n'
+                        '最終更新: ${dateTimeText(data['updatedAt'])} '
+                        '（${elapsedText(data['updatedAt'])}）',
+                      ),
+                      isThreeLine: true,
+                      trailing: const Icon(Icons.map_outlined),
+                      onTap: () => openOfflineMap(
+                        focusUser: {'userId': doc.id, ...data},
+                      ),
+                    );
+                  }).toList(),
+                );
+              },
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   Widget friendRegisterCard() {
     return Card(
       child: Padding(
@@ -1237,7 +2854,7 @@ class _MyHomePageState extends State<MyHomePage> {
             ),
             const SizedBox(height: 8),
             const Text(
-              '友達のIDだけを登録します。名前・状態・位置は友達本人のデータから読み取ります。',
+              '友達のIDを登録します。お互いにIDを登録すると、名前・安否・位置を共有できます。',
               textAlign: TextAlign.center,
             ),
             const SizedBox(height: 12),
@@ -1262,82 +2879,12 @@ class _MyHomePageState extends State<MyHomePage> {
               icon: const Icon(Icons.map),
               label: const Text('友達全員を地図で見る'),
             ),
-          ],
-        ),
-      ),
-    );
-  }
 
-  Widget offlineRelayQrCard() {
-    return Card(
-      color: Colors.lightBlue.shade50,
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          children: [
-            const Text(
-              'オフライン伝言QR',
-              style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold),
+            ElevatedButton.icon(
+              onPressed: openOfflineMap,
+              icon: const Icon(Icons.map),
+              label: const Text('オフライン地図テスト'),
             ),
-            const SizedBox(height: 8),
-            const Text(
-              'Aさんの情報をBさんが読み取り、BさんがAさん情報だけをCさんに渡せます。\nCさんには「Bさん経由」と表示されます。',
-              textAlign: TextAlign.center,
-            ),
-            const SizedBox(height: 12),
-            Wrap(
-              spacing: 8,
-              runSpacing: 8,
-              alignment: WrapAlignment.center,
-              children: [
-                ElevatedButton.icon(
-                  onPressed: showMyDisasterInfoQr,
-                  icon: const Icon(Icons.qr_code),
-                  label: const Text('自分の災害情報QR'),
-                ),
-                ElevatedButton.icon(
-                  onPressed: openQrScanner,
-                  icon: const Icon(Icons.qr_code_scanner),
-                  label: const Text('災害QRを読み取る'),
-                ),
-              ],
-            ),
-            const SizedBox(height: 10),
-            const Text(
-              '※共有QRには、共有対象者の情報だけを入れます。中継者本人の位置・安否・電池情報は入りません。',
-              textAlign: TextAlign.center,
-              style: TextStyle(fontSize: 12, color: Colors.black87),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget relayedPeopleCard() {
-    return Card(
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          children: [
-            const Text(
-              '読み取った災害情報',
-              style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold),
-            ),
-            const SizedBox(height: 8),
-            const Text(
-              'QRで読み取った人の情報です。共有するときは、その人の情報だけをQRにします。',
-              textAlign: TextAlign.center,
-            ),
-            const SizedBox(height: 10),
-            if (relayedPeople.isEmpty)
-              const Text('まだ読み取った災害情報はありません')
-            else
-              Column(
-                children: relayedPeople
-                    .map((person) => buildRelayedPersonTile(person))
-                    .toList(),
-              ),
           ],
         ),
       ),
@@ -1356,7 +2903,7 @@ class _MyHomePageState extends State<MyHomePage> {
             ),
             const SizedBox(height: 8),
             const Text(
-              'ここに表示される状態・救助要請・位置は、友達本人の端末から送られた情報です。',
+              '友達本人もあなたのIDを登録すると共有が有効になります。救助要請中の人は全利用者に公開されます。',
               textAlign: TextAlign.center,
             ),
             const SizedBox(height: 10),
@@ -1372,96 +2919,66 @@ class _MyHomePageState extends State<MyHomePage> {
     );
   }
 
-@override
+  @override
   Widget build(BuildContext context) {
+    final pendingCount = relayQueue
+        .where((item) => item['syncStatus'] == 'pending')
+        .length;
+
     return Scaffold(
-      // 背景色を清潔感のある明るいグレーに設定
-      backgroundColor: const Color(0xFFF8F9FA),
       appBar: AppBar(
-        title: const Text(
-          '災害位置共有アプリ',
-          style: TextStyle(fontWeight: FontWeight.bold, fontSize: 18),
+        title: Text(
+          pendingCount > 0 ? '災害位置共有アプリ（未送信$pendingCount件）' : '災害位置共有アプリ',
         ),
-        elevation: 0,
-        backgroundColor: const Color(0xFF1A365D), // 信頼感のあるネイビー
-        foregroundColor: Colors.white,
-        centerTitle: false,
+        backgroundColor: Theme.of(context).colorScheme.inversePrimary,
         actions: [
+          IconButton(icon: const Icon(Icons.qr_code), onPressed: showMyQrCode),
           IconButton(
-            icon: const Icon(Icons.map_outlined),
-            tooltip: '全員の位置を地図で見る',
+            tooltip: 'アカウント',
+            icon: const Icon(Icons.account_circle_outlined),
+            onPressed: openAccountPage,
+          ),
+          IconButton(
+            tooltip: '管理者画面',
+            icon: const Icon(Icons.admin_panel_settings_outlined),
+            onPressed: () => Navigator.push(
+              context,
+              MaterialPageRoute(builder: (_) => const AdminDashboardPage()),
+            ),
+          ),
+          IconButton(
+            icon: const Icon(Icons.groups),
             onPressed: openAllUsersMap,
+          ),
+          IconButton(
+            icon: const Icon(Icons.sync),
+            onPressed: syncPendingRelayQueue,
           ),
         ],
       ),
-      body: SafeArea(
-        child: Center(
-          // PC画面での横伸びを防ぐレスポンシブ制約（最大幅600px）
-          child: ConstrainedBox(
-            constraints: const BoxConstraints(maxWidth: 600),
-            child: SingleChildScrollView(
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 16),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-                  // 1. 【最優先】自分の安否状態 ＋ SOS要請
-                  myStatusCard(),
-                  const SizedBox(height: 16),
-
-                  // 2. 方角コンパス
-                  const CompassWidget(),
-                  const SizedBox(height: 16),
-
-                  // 3. 【クイックアクション】オフライン伝言QR
-                  offlineRelayQrCard(),
-                  const SizedBox(height: 16),
-
-                  // 4. 現在地・バッテリー状況
-                  myLocationCard(),
-                  const SizedBox(height: 16),
-
-                  // 5. 読み取った災害情報
-                  relayedPeopleCard(),
-                  const SizedBox(height: 16),
-
-                  // 6. 友達登録 ＆ 友達一覧
-                  friendRegisterCard(),
-                  const SizedBox(height: 16),
-                  friendListCard(),
-                  const SizedBox(height: 16),
-
-                  // 7. 端末プロフィール設定（折りたたみ化）
-                  Card(
-                    elevation: 0,
-                    color: Colors.white,
-                    shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(12),
-                      side: BorderSide(color: Colors.grey.shade300),
-                    ),
-                    child: ExpansionTile(
-                      leading: const Icon(Icons.person_outline, color: Colors.black54),
-                      title: const Text(
-                        '端末・プロフィール設定',
-                        style: TextStyle(
-                          fontSize: 14,
-                          fontWeight: FontWeight.w600,
-                          color: Colors.black87,
-                        ),
-                      ),
-                      children: [
-                        Padding(
-                          padding: const EdgeInsets.all(12.0),
-                          child: myProfileCard(),
-                        ),
-                      ],
-                    ),
-                  ),
-
-                  const SizedBox(height: 40),
-                ],
-              ),
-            ),
-          ),
+      body: SingleChildScrollView(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          children: [
+            myProfileCard(),
+            const SizedBox(height: 12),
+            myLocationCard(),
+            const SizedBox(height: 12),
+            myStatusCard(),
+            const SizedBox(height: 12),
+            offlineRelayCard(),
+            const SizedBox(height: 12),
+            relayQueueCard(),
+            const SizedBox(height: 12),
+            cloudRelayLatestCard(),
+            const SizedBox(height: 12),
+            emergencyRequestsCard(),
+            const SizedBox(height: 12),
+            friendRegisterCard(),
+            const SizedBox(height: 12),
+            friendListCard(),
+            const SizedBox(height: 40),
+          ],
         ),
       ),
     );
@@ -1651,26 +3168,26 @@ class AllUsersMapPage extends StatelessWidget {
     dynamic batteryLevelValue,
   ) {
     if (rescue) {
-      return Colors.red.withOpacity(0.18);
+      return Colors.red.withValues(alpha: 0.18);
     }
 
     if (isLowBattery(batteryLevelValue)) {
-      return Colors.red.withOpacity(0.12);
+      return Colors.red.withValues(alpha: 0.12);
     }
 
     if (connStatus == 'offlineCandidate') {
-      return Colors.grey.withOpacity(0.18);
+      return Colors.grey.withValues(alpha: 0.18);
     }
 
     if (connStatus == 'old') {
-      return Colors.deepOrange.withOpacity(0.14);
+      return Colors.deepOrange.withValues(alpha: 0.14);
     }
 
     if (connStatus == 'delayed') {
-      return Colors.orange.withOpacity(0.14);
+      return Colors.orange.withValues(alpha: 0.14);
     }
 
-    return Colors.blue.withOpacity(0.14);
+    return Colors.blue.withValues(alpha: 0.14);
   }
 
   Color accuracyCircleBorderColor(
@@ -1679,26 +3196,26 @@ class AllUsersMapPage extends StatelessWidget {
     dynamic batteryLevelValue,
   ) {
     if (rescue) {
-      return Colors.red.withOpacity(0.65);
+      return Colors.red.withValues(alpha: 0.65);
     }
 
     if (isLowBattery(batteryLevelValue)) {
-      return Colors.red.withOpacity(0.5);
+      return Colors.red.withValues(alpha: 0.5);
     }
 
     if (connStatus == 'offlineCandidate') {
-      return Colors.grey.withOpacity(0.65);
+      return Colors.grey.withValues(alpha: 0.65);
     }
 
     if (connStatus == 'old') {
-      return Colors.deepOrange.withOpacity(0.55);
+      return Colors.deepOrange.withValues(alpha: 0.55);
     }
 
     if (connStatus == 'delayed') {
-      return Colors.orange.withOpacity(0.55);
+      return Colors.orange.withValues(alpha: 0.55);
     }
 
-    return Colors.blue.withOpacity(0.45);
+    return Colors.blue.withValues(alpha: 0.45);
   }
 
   double accuracyRadius(dynamic value) {
@@ -1780,6 +3297,16 @@ class AllUsersMapPage extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final targetIds = {
+      if (myUserId.isNotEmpty) myUserId,
+      ...friendIds.where((id) => id.isNotEmpty),
+    };
+    final queryIds = targetIds.take(30).toList();
+
+    if (queryIds.isEmpty) {
+      return const Scaffold(body: Center(child: Text('表示できるユーザーIDがありません')));
+    }
+
     return Scaffold(
       appBar: AppBar(title: const Text('全員の位置')),
       body: Column(
@@ -1799,8 +3326,22 @@ class AllUsersMapPage extends StatelessWidget {
             child: StreamBuilder<QuerySnapshot>(
               stream: FirebaseFirestore.instance
                   .collection('users')
+                  .where(FieldPath.documentId, whereIn: queryIds)
                   .snapshots(),
               builder: (context, snapshot) {
+                if (snapshot.hasError) {
+                  return const Center(
+                    child: Padding(
+                      padding: EdgeInsets.all(16),
+                      child: Text(
+                        'ユーザーの位置情報を取得できません。\n'
+                        '通信状態またはアクセス権限を確認してください。',
+                        textAlign: TextAlign.center,
+                      ),
+                    ),
+                  );
+                }
+
                 if (!snapshot.hasData) {
                   return const Center(child: CircularProgressIndicator());
                 }
@@ -1810,10 +3351,8 @@ class AllUsersMapPage extends StatelessWidget {
 
                 LatLng center = const LatLng(26.6232, 127.9747);
 
-                final allowedIds = <String>{myUserId, ...friendIds};
-
                 for (final doc in snapshot.data!.docs) {
-                  if (!allowedIds.contains(doc.id)) continue;
+                  if (!targetIds.contains(doc.id)) continue;
 
                   final data = doc.data() as Map<String, dynamic>;
 
@@ -1972,7 +3511,9 @@ class AllUsersMapPage extends StatelessWidget {
                     TileLayer(
                       urlTemplate:
                           'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
-                      userAgentPackageName: 'com.example.myapp',
+                      tileProvider: NetworkTileProvider(),
+                      maxNativeZoom: 19,
+                      maxZoom: 19,
                     ),
                     CircleLayer(circles: accuracyCircles),
                     MarkerLayer(markers: markers),
@@ -1984,628 +3525,5 @@ class AllUsersMapPage extends StatelessWidget {
         ],
       ),
     );
-  }
-}
-// ログイン・新規登録画面
-class LoginPage extends StatefulWidget {
-  const LoginPage({super.key});
-
-  @override
-  State<LoginPage> createState() => _LoginPageState();
-}
-
-class _LoginPageState extends State<LoginPage> {
-  bool _isSignUp = false; // false: ログインモード, true: 新規登録モード
-  final TextEditingController _inputController = TextEditingController();
-  bool _isLoading = false;
-
-  // ログイン処理（IDまたはメールアドレス）
-  Future<void> _login() async {
-    final input = _inputController.text.trim();
-    if (input.isEmpty) {
-      _showSnackBar('IDまたはメールアドレスを入力してください');
-      return;
-    }
-
-    setState(() => _isLoading = true);
-
-    try {
-      String? targetUserId;
-      Map<String, dynamic>? userData;
-
-      if (input.contains('@')) {
-        // ① メールアドレスでの検索
-        final query = await FirebaseFirestore.instance
-            .collection('users')
-            .where('email', isEqualTo: input)
-            .limit(1)
-            .get();
-
-        if (query.docs.isNotEmpty) {
-          targetUserId = query.docs.first.id;
-          userData = query.docs.first.data();
-        }
-      } else {
-        // ② ユーザーIDでの検索
-        final doc = await FirebaseFirestore.instance.collection('users').doc(input).get();
-        if (doc.exists) {
-          targetUserId = doc.id;
-          userData = doc.data();
-        }
-      }
-
-      if (!mounted) return;
-
-      if (userData == null || targetUserId == null) {
-        _showSnackBar('該当するアカウントが見つかりませんでした');
-        return;
-      }
-
-      // IDのローカル保存
-      final prefs = await SharedPreferences.getInstance();
-      await prefs.setString('user_id', targetUserId);
-
-      if (!mounted) return;
-
-      // ロールに応じた画面遷移
-      if (userData['role'] == 'host') {
-        Navigator.pushReplacement(
-          context,
-          MaterialPageRoute(builder: (context) => const HostPage()),
-        );
-      } else {
-        Navigator.pushReplacement(
-          context,
-          MaterialPageRoute(builder: (context) => const MyHomePage()),
-        );
-      }
-    } catch (e) {
-      if (!mounted) return;
-      _showSnackBar('エラーが発生しました: $e');
-    } finally {
-      if (mounted) setState(() => _isLoading = false);
-    }
-  }
-
-  // 新規アカウント作成処理
-  Future<void> _signUp() async {
-    final email = _inputController.text.trim();
-    if (email.isEmpty || !email.contains('@')) {
-      _showSnackBar('有効なメールアドレスを入力してください');
-      return;
-    }
-
-    setState(() => _isLoading = true);
-
-    try {
-      // 既存のメールアドレスチェック
-      final existing = await FirebaseFirestore.instance
-          .collection('users')
-          .where('email', isEqualTo: email)
-          .limit(1)
-          .get();
-
-      if (existing.docs.isNotEmpty) {
-        if (!mounted) return;
-        _showSnackBar('このメールアドレスは既に登録されています。ログインしてください。');
-        return;
-      }
-
-      // 新しいIDを自動割り振る (例: user_タイムスタンプ)
-      final generatedId = 'user_${DateTime.now().millisecondsSinceEpoch}';
-
-      // Firestoreに登録
-      await FirebaseFirestore.instance.collection('users').doc(generatedId).set({
-        'userId': generatedId,
-        'email': email,
-        'role': 'general',
-        'createdAt': FieldValue.serverTimestamp(),
-      }, SetOptions(merge: true));
-
-      // IDをローカル保存
-      final prefs = await SharedPreferences.getInstance();
-      await prefs.setString('user_id', generatedId);
-
-      if (!mounted) return;
-
-      // 割り振られたIDをユーザーにお知らせして画面遷移
-      await showDialog(
-        context: context,
-        barrierDismissible: false,
-        builder: (context) => AlertDialog(
-          title: const Text('アカウント作成完了'),
-          content: Text('あなた専用のユーザーIDが発行されました:\n\n$generatedId\n\n次回からはこのIDまたはメールアドレスでログインできます。'),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(context),
-              child: const Text('OK'),
-            ),
-          ],
-        ),
-      );
-
-      if (!mounted) return;
-
-      // 一般向け画面へ遷移
-      Navigator.pushReplacement(
-        context,
-        MaterialPageRoute(builder: (context) => const MyHomePage()),
-      );
-    } catch (e) {
-      if (!mounted) return;
-      _showSnackBar('登録エラーが発生しました: $e');
-    } finally {
-      if (mounted) setState(() => _isLoading = false);
-    }
-  }
-
-  void _showSnackBar(String text) {
-    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(text)));
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(
-        title: Text(_isSignUp ? '新規アカウント作成' : 'ログイン'),
-      ),
-      body: Padding(
-        padding: const EdgeInsets.all(24.0),
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            Icon(
-              _isSignUp ? Icons.person_add : Icons.security,
-              size: 80,
-              color: Colors.indigo,
-            ),
-            const SizedBox(height: 24),
-
-            // モード切り替え（ログイン / 新規作成）
-            Row(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                ChoiceChip(
-                  label: const Text('ログイン'),
-                  selected: !_isSignUp,
-                  onSelected: (selected) {
-                    if (selected) setState(() => _isSignUp = false);
-                  },
-                ),
-                const SizedBox(width: 12),
-                ChoiceChip(
-                  label: const Text('新規作成'),
-                  selected: _isSignUp,
-                  onSelected: (selected) {
-                    if (selected) setState(() => _isSignUp = true);
-                  },
-                ),
-              ],
-            ),
-            const SizedBox(height: 24),
-
-            // 入力フィールド
-            TextField(
-              controller: _inputController,
-              decoration: InputDecoration(
-                labelText: _isSignUp ? 'メールアドレスを入力' : 'ID または メールアドレスを入力',
-                border: const OutlineInputBorder(),
-                prefixIcon: Icon(_isSignUp ? Icons.email : Icons.person),
-              ),
-            ),
-            const SizedBox(height: 20),
-
-            // 実行ボタン
-            _isLoading
-                ? const CircularProgressIndicator()
-                : SizedBox(
-                    width: double.infinity,
-                    height: 50,
-                    child: ElevatedButton(
-                      onPressed: _isSignUp ? _signUp : _login,
-                      child: Text(
-                        _isSignUp ? 'アカウントを作成してスタート' : 'ログイン',
-                        style: const TextStyle(fontSize: 18),
-                      ),
-                    ),
-                  ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-// ホスト専用画面（アプリ内マップ表示機能付き）
-class HostPage extends StatefulWidget {
-  const HostPage({super.key});
-
-  @override
-  State<HostPage> createState() => _HostPageState();
-}
-
-class _HostPageState extends State<HostPage> {
-  String _statusFilter = 'ALL'; // 'ALL', 'RESCUE', 'SAFE'
-  bool _lowBatteryOnly = false; // 充電20%以下フィルター
-
-  // ユーザー詳細 & アプリ内マップダイアログの表示
-  void _showUserDetailDialog(
-    BuildContext context,
-    String name,
-    String email,
-    String userId,
-    String safetyStatus,
-    int battery,
-    dynamic lat,
-    dynamic lng,
-  ) {
-    // 座標値の数値変換
-    final double? latitude = lat is num ? lat.toDouble() : double.tryParse(lat?.toString() ?? '');
-    final double? longitude = lng is num ? lng.toDouble() : double.tryParse(lng?.toString() ?? '');
-    final bool hasLocation = latitude != null && longitude != null;
-
-    showDialog(
-      context: context,
-      builder: (context) {
-        return AlertDialog(
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-          title: Row(
-            children: [
-              const Icon(Icons.person_pin_circle, color: Colors.indigo, size: 28),
-              const SizedBox(width: 8),
-              Expanded(
-                child: Text(
-                  '$name さんの詳細情報',
-                  style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
-                ),
-              ),
-            ],
-          ),
-          content: SingleChildScrollView(
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-             crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text('メールアドレス: $email'),
-                Text('ユーザーID: $userId'),
-                const Divider(height: 20),
-                Text('安否状況: $safetyStatus', style: const TextStyle(fontWeight: FontWeight.bold)),
-                Text('バッテリー残量: $battery%'),
-                const SizedBox(height: 12),
-                
-                // 位置情報がある場合：アプリ内で地図を表示
-                if (hasLocation) ...[
-                  const Text('📍 位置情報マップ:', style: TextStyle(fontWeight: FontWeight.bold)),
-                  const SizedBox(height: 8),
-                  ClipRRect(
-                    borderRadius: BorderRadius.circular(12),
-                    child: SizedBox(
-                      height: 220,
-                      width: double.maxFinite,
-                      child: FlutterMap(
-                        options: MapOptions(
-                          initialCenter: LatLng(latitude, longitude),
-                          initialZoom: 15.0,
-                        ),
-                        children: [
-                          TileLayer(
-                            urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
-                            userAgentPackageName: 'com.example.disaster_location_app',
-                          ),
-                          MarkerLayer(
-                            markers: [
-                              Marker(
-                                point: LatLng(latitude, longitude),
-                                width: 40,
-                                height: 40,
-                                child: const Icon(
-                                  Icons.location_on,
-                                  color: Colors.red,
-                                  size: 40,
-                                ),
-                              ),
-                            ],
-                          ),
-                        ],
-                      ),
-                    ),
-                  ),
-                  const SizedBox(height: 6),
-                  Text(
-                    '緯度: $latitude, 経度: $longitude',
-                    style: const TextStyle(fontSize: 11, color: Colors.grey),
-                  ),
-                ] else ...[
-                  Container(
-                    width: double.infinity,
-                    padding: const EdgeInsets.all(12),
-                    decoration: BoxDecoration(
-                      color: Colors.grey.shade200,
-                      borderRadius: BorderRadius.circular(8),
-                    ),
-                    child: const Row(
-                      children: [
-                        Icon(Icons.location_off, color: Colors.grey),
-                        SizedBox(width: 8),
-                        Text('位置情報が登録されていません', style: TextStyle(color: Colors.black54)),
-                      ],
-                    ),
-                  ),
-                ],
-              ],
-            ),
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(context),
-              child: const Text('閉じる'),
-            ),
-          ],
-        );
-      },
-    );
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('ホスト管理者画面'),
-        backgroundColor: Colors.indigo,
-        foregroundColor: Colors.white,
-        actions: [
-          IconButton(
-            icon: const Icon(Icons.logout),
-            tooltip: 'ログアウト',
-            onPressed: () {
-              Navigator.pushReplacement(
-                context,
-                MaterialPageRoute(builder: (context) => const LoginPage()),
-              );
-            },
-          ),
-        ],
-      ),
-      body: Column(
-        children: [
-          // ① 絞り込みフィルター（操作バー）
-          Container(
-            padding: const EdgeInsets.all(12),
-            color: Colors.indigo.shade50,
-            child: SingleChildScrollView(
-              scrollDirection: Axis.horizontal,
-              child: Row(
-                children: [
-                  const Text('表示切替: ', style: TextStyle(fontWeight: FontWeight.bold)),
-                  const SizedBox(width: 8),
-                  FilterChip(
-                    label: const Text('ALL'),
-                    selected: _statusFilter == 'ALL',
-                    onSelected: (selected) => setState(() => _statusFilter = 'ALL'),
-                  ),
-                  const SizedBox(width: 8),
-                  FilterChip(
-                    avatar: const Icon(Icons.warning, color: Colors.red, size: 18),
-                    label: const Text('要救助 / 重症'),
-                    selected: _statusFilter == 'RESCUE',
-                    selectedColor: Colors.red.shade100,
-                    onSelected: (selected) => setState(() => _statusFilter = 'RESCUE'),
-                  ),
-                  const SizedBox(width: 8),
-                  FilterChip(
-                    avatar: const Icon(Icons.check_circle, color: Colors.green, size: 18),
-                    label: const Text('無事'),
-                    selected: _statusFilter == 'SAFE',
-                    selectedColor: Colors.green.shade100,
-                    onSelected: (selected) => setState(() => _statusFilter = 'SAFE'),
-                  ),
-                  const SizedBox(width: 16),
-                  FilterChip(
-                    avatar: const Icon(Icons.battery_alert, color: Colors.orange, size: 18),
-                    label: const Text('充電20%以下'),
-                    selected: _lowBatteryOnly,
-                    selectedColor: Colors.orange.shade100,
-                    onSelected: (selected) => setState(() => _lowBatteryOnly = selected),
-                  ),
-                ],
-              ),
-            ),
-          ),
-
-          // ② ユーザーリスト
-          Expanded(
-            child: StreamBuilder<QuerySnapshot>(
-              stream: FirebaseFirestore.instance.collection('users').snapshots(),
-              builder: (context, snapshot) {
-                if (snapshot.hasError) {
-                  return Center(child: Text('エラーが発生しました: ${snapshot.error}'));
-                }
-                if (snapshot.connectionState == ConnectionState.waiting) {
-                  return const Center(child: CircularProgressIndicator());
-                }
-
-                final docs = snapshot.data?.docs ?? [];
-
-                final filteredUsers = docs.where((doc) {
-                  final data = doc.data() as Map<String, dynamic>;
-
-                  final isRescue = data['rescueRequest'] == true ||
-                      data['safetyStatus'] == '重症' ||
-                      data['safetyStatus'] == '要救助';
-                  final isSafe = data['safetyStatus'] == '無事';
-                  final battery = (data['batteryLevel'] as num?)?.toInt() ?? 100;
-
-                  if (_statusFilter == 'RESCUE' && !isRescue) return false;
-                  if (_statusFilter == 'SAFE' && !isSafe) return false;
-                  if (_lowBatteryOnly && battery > 20) return false;
-
-                  return true;
-                }).toList();
-
-                if (filteredUsers.isEmpty) {
-                  return const Center(
-                    child: Text(
-                      '指定した条件に該当するユーザーはいません',
-                      style: TextStyle(fontSize: 16, color: Colors.grey),
-                    ),
-                  );
-                }
-
-                return ListView.builder(
-                  padding: const EdgeInsets.all(12),
-                  itemCount: filteredUsers.length,
-                  itemBuilder: (context, index) {
-                    final data = filteredUsers[index].data() as Map<String, dynamic>;
-
-                    final name = data['displayName'] ?? '名前なし';
-                    final email = data['email'] ?? 'メールなし';
-                    final userId = data['userId'] ?? filteredUsers[index].id;
-                    final safetyStatus = data['safetyStatus'] ?? '未登録';
-                    final isRescue = data['rescueRequest'] == true || safetyStatus == '重症';
-                    final battery = (data['batteryLevel'] as num?)?.toInt() ?? 0;
-                    final lat = data['latitude'];
-                    final lng = data['longitude'];
-
-                    return Card(
-                      elevation: 3,
-                      margin: const EdgeInsets.symmetric(vertical: 6),
-                      child: ListTile(
-                        onTap: () {
-                          _showUserDetailDialog(
-                            context,
-                            name,
-                            email,
-                            userId,
-                            safetyStatus,
-                            battery,
-                            lat,
-                            lng,
-                          );
-                        },
-                        leading: CircleAvatar(
-                          backgroundColor: isRescue ? Colors.red : Colors.green,
-                          child: Icon(
-                            isRescue ? Icons.warning_amber_rounded : Icons.person,
-                            color: Colors.white,
-                          ),
-                        ),
-                        title: Row(
-                          children: [
-                            Text(name, style: const TextStyle(fontWeight: FontWeight.bold)),
-                            const SizedBox(width: 8),
-                            Text('($email)', style: const TextStyle(fontSize: 12, color: Colors.grey)),
-                          ],
-                        ),
-                        subtitle: Padding(
-                          padding: const EdgeInsets.only(top: 4),
-                          child: Column(
-                           crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Text('ID: $userId'),
-                              Text('安否状況: $safetyStatus'),
-                              Text('位置情報: ${lat != null && lng != null ? "$lat, $lng" : "未取得"}'),
-                            ],
-                          ),
-                        ),
-                        trailing: Column(
-                          mainAxisAlignment: MainAxisAlignment.center,
-                          children: [
-                            Icon(
-                              battery <= 20 ? Icons.battery_alert : Icons.battery_std,
-                              color: battery <= 20 ? Colors.red : Colors.grey,
-                            ),
-                            Text('$battery%', style: const TextStyle(fontSize: 12)),
-                          ],
-                        ),
-                      ),
-                    );
-                  },
-                );
-              },
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-
-// コンパス表示用Widget
-class CompassWidget extends StatelessWidget {
-  const CompassWidget({super.key});
-
-  @override
-  Widget build(BuildContext context) {
-    return StreamBuilder<CompassEvent>(
-      stream: FlutterCompass.events,
-      builder: (context, snapshot) {
-        if (snapshot.hasError) {
-          return const Text('センサーエラーが発生しました');
-        }
-
-        if (snapshot.connectionState == ConnectionState.waiting) {
-          return const CircularProgressIndicator();
-        }
-
-        // 方位角（北を0度とした角度）を取得
-        final double? heading = snapshot.data?.heading;
-
-        if (heading == null) {
-          return const Text('端末のコンパスセンサー非対応（またはWeb環境）です');
-        }
-
-        // ラジアンへ変換
-        final double headingRad = heading * (math.pi / 180);
-
-        return Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Text(
-              '${heading.toStringAsFixed(0)}° ${_getDirectionName(heading)}',
-              style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
-            ),
-            const SizedBox(height: 8),
-            Transform.rotate(
-              angle: -headingRad,
-              child: Stack(
-                alignment: Alignment.center,
-                children: [
-                  Container(
-                    width: 120,
-                    height: 120,
-                    decoration: BoxDecoration(
-                      shape: BoxShape.circle,
-                      border: Border.all(color: Colors.indigo, width: 3),
-                    ),
-                  ),
-                  const Positioned(
-                    top: 6,
-                    child: Text('N', style: TextStyle(fontWeight: FontWeight.bold, color: Colors.red)),
-                  ),
-                  const Icon(
-                    Icons.navigation,
-                    size: 60,
-                    color: Colors.indigo,
-                  ),
-                ],
-              ),
-            ),
-          ],
-        );
-      },
-    );
-  }
-
-  String _getDirectionName(double heading) {
-    if (heading >= 337.5 || heading < 22.5) return '北';
-    if (heading >= 22.5 && heading < 67.5) return '北東';
-    if (heading >= 67.5 && heading < 112.5) return '東';
-    if (heading >= 112.5 && heading < 157.5) return '南東';
-    if (heading >= 157.5 && heading < 202.5) return '南';
-    if (heading >= 202.5 && heading < 247.5) return '南西';
-    if (heading >= 247.5 && heading < 292.5) return '西';
-    if (heading >= 292.5 && heading < 337.5) return '北西';
-    return '';
   }
 }

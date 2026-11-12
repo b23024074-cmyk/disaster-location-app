@@ -23,13 +23,13 @@
   <!-- iOS meta tags & icons -->
   <meta name="mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black">
-  <meta name="apple-mobile-web-app-title" content="my_app">
+  <meta name="apple-mobile-web-app-title" content="myapp">
   <link rel="apple-touch-icon" href="icons/Icon-192.png">
 
   <!-- Favicon -->
   <link rel="icon" type="image/png" href="favicon.png"/>
 
-  <title>my_app</title>
+  <title>myapp</title>
   <link rel="manifest" href="manifest.json">
 </head>
 <body>
@@ -41,6 +41,22 @@
     For more details:
     * https://docs.flutter.dev/platform-integration/web/initialization
   -->
-  <script src="flutter_bootstrap.js" async></script>
+
+<script src="flutter_bootstrap.js" async></script>
+
+<script>
+  if ('serviceWorker' in navigator) {
+    window.addEventListener('load', () => {
+      navigator.serviceWorker
+        .register('./offline-map-sw.js', { scope: './' })
+        .then((registration) => {
+          console.log('オフライン地図SW登録成功:', registration.scope);
+        })
+        .catch((error) => {
+          console.error('オフライン地図SW登録失敗:', error);
+        });
+    });
+  }
+</script>
 </body>
 </html>
